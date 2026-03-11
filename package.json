@@ -1,0 +1,8 @@
+{
+  "name": "netplan-pro-v4",
+  "version": "4.0.0",
+  "private": true,
+  "dependencies": {
+    "@vercel/kv": "^1.0.1"
+  }
+}
