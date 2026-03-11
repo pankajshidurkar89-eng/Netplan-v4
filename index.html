@@ -1,0 +1,1459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>NETPLAN PRO v4</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#03060d;color:#dce8f6;font-family:'JetBrains Mono','Fira Code',monospace;font-size:13px}
+input[type=range]{-webkit-appearance:none;width:100%;height:4px;background:#162030;border-radius:2px;outline:none}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:#0ea5e9;cursor:pointer}
+::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:#07101c}::-webkit-scrollbar-thumb{background:#1c2e44;border-radius:3px}
+select option{background:#0b1522}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+
+// ─── SESSION CACHE ────────────────────────────────────────────────────────────
+const SESSION = { suggest: {}, geo: {}, route: {} };
+
+// ─── API SOURCE DETECTION ─────────────────────────────────────────────────────
+// Detects whether MapmyIndia API is available.
+// On first call, pings /api/suggest — if it returns results, MMI is live.
+// Falls back to Nominatim + OSRM (free, no key needed) if MMI not configured.
+let _mmiStatus = null; // null=unknown, true=live, false=fallback
+async function checkMmi() {
+  if (_mmiStatus !== null) return _mmiStatus;
+  try {
+    const r = await fetch("/api/suggest?q=Mumbai", { signal: AbortSignal.timeout(4000) });
+    const d = await r.json();
+    _mmiStatus = Array.isArray(d.results) && d.results.length > 0;
+  } catch { _mmiStatus = false; }
+  return _mmiStatus;
+}
+
+// ─── NOMINATIM FALLBACK (free, no key) ───────────────────────────────────────
+async function nominatimSearch(q) {
+  const k = q.trim().toLowerCase();
+  if (SESSION.suggest[k]) return SESSION.suggest[k];
+  try {
+    const r = await fetch(
+      `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q+",India")}&countrycodes=in&format=json&limit=7`,
+      { headers: { "Accept-Language": "en", "User-Agent": "NetPlanPro/4.0" } }
+    );
+    const d = await r.json();
+    const results = d.map(x => ({
+      placeName:    x.display_name.split(",")[0].trim(),
+      placeAddress: x.display_name,
+      eLoc:         `NOM_${x.place_id}`,   // synthetic eLoc for fallback path
+      lat:          parseFloat(x.lat),
+      lng:          parseFloat(x.lon),
+      type:         x.type || x.class,
+      _fromNominatim: true,
+    }));
+    SESSION.suggest[k] = results;
+    return results;
+  } catch { return []; }
+}
+
+// ─── OSRM FALLBACK (free, no key) ────────────────────────────────────────────
+function hvs(la1,lo1,la2,lo2){
+  const R=6371,x=(la2-la1)*Math.PI/180,y=(lo2-lo1)*Math.PI/180;
+  const a=Math.sin(x/2)**2+Math.cos(la1*Math.PI/180)*Math.cos(la2*Math.PI/180)*Math.sin(y/2)**2;
+  return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+}
+const hvRoad=(la1,lo1,la2,lo2)=>Math.round(hvs(la1,lo1,la2,lo2)*1.3);
+
+async function osrmRoute(olat, olng, dlat, dlng) {
+  const k = `${olat.toFixed(3)},${olng.toFixed(3)}|${dlat.toFixed(3)},${dlng.toFixed(3)}`;
+  if (SESSION.route[k]) return SESSION.route[k];
+  try {
+    const r = await fetch(
+      `https://router.project-osrm.org/route/v1/driving/${olng},${olat};${dlng},${dlat}?overview=false`,
+      { signal: AbortSignal.timeout(6000) }
+    );
+    const d = await r.json();
+    if (d.code === "Ok" && d.routes?.length) {
+      const res = { dist: Math.round(d.routes[0].distance/1000), dur: Math.round(d.routes[0].duration/3600*10)/10, live: true, source:"osrm" };
+      SESSION.route[k] = res; return res;
+    }
+  } catch {}
+  const res = { dist: hvRoad(olat,olng,dlat,dlng), dur:0, live:false, source:"estimate" };
+  SESSION.route[k] = res; return res;
+}
+
+// ─── UNIFIED API HELPERS (MapmyIndia → fallback Nominatim/OSRM) ──────────────
+async function apiSuggest(q) {
+  const k = q.trim().toLowerCase();
+  if (SESSION.suggest[k]) return SESSION.suggest[k];
+  const mmi = await checkMmi();
+  if (mmi) {
+    try {
+      const r = await fetch(`/api/suggest?q=${encodeURIComponent(q)}`, { signal: AbortSignal.timeout(5000) });
+      const d = await r.json();
+      if (d.results?.length) { SESSION.suggest[k] = d.results; return d.results; }
+    } catch {}
+  }
+  // Fallback to Nominatim
+  return nominatimSearch(q);
+}
+
+async function apiGeocode(eLocOrSynthetic) {
+  if (SESSION.geo[eLocOrSynthetic]) return SESSION.geo[eLocOrSynthetic];
+  // Synthetic eLoc from Nominatim fallback — already has lat/lng in suggest result
+  // Real MMI eLoc — call /api/geocode
+  if (!eLocOrSynthetic.startsWith("NOM_")) {
+    try {
+      const r = await fetch(`/api/geocode?eloc=${encodeURIComponent(eLocOrSynthetic)}`, { signal: AbortSignal.timeout(5000) });
+      if (r.ok) {
+        const d = await r.json();
+        if (!d.error && d.lat) { SESSION.geo[eLocOrSynthetic] = d; return d; }
+      }
+    } catch {}
+  }
+  return null; // lat/lng already attached in suggest result for Nominatim path
+}
+
+async function apiRoute(olat, olng, dlat, dlng) {
+  const k = `${olat.toFixed(3)},${olng.toFixed(3)}|${dlat.toFixed(3)},${dlng.toFixed(3)}`;
+  if (SESSION.route[k]) return SESSION.route[k];
+  const mmi = await checkMmi();
+  if (mmi) {
+    try {
+      const r = await fetch(`/api/route?olat=${olat}&olng=${olng}&dlat=${dlat}&dlng=${dlng}`, { signal: AbortSignal.timeout(8000) });
+      if (r.ok) {
+        const d = await r.json();
+        if (d.dist > 0) { SESSION.route[k] = { ...d, source:"mappls" }; return SESSION.route[k]; }
+      }
+    } catch {}
+  }
+  // Fallback to OSRM
+  return osrmRoute(olat, olng, dlat, dlng);
+}
+
+// ─── LNG STATIONS ─────────────────────────────────────────────────────────────
+const LNG_STNS = [
+  {id:"S01",name:"Manesar",lat:28.358,lng:76.931,nh:"NH48"},{id:"S02",name:"Jaipur",lat:26.913,lng:75.787,nh:"NH48"},
+  {id:"S03",name:"Ahmedabad",lat:23.023,lng:72.572,nh:"NH48"},{id:"S04",name:"Vadodara",lat:22.307,lng:73.181,nh:"NH48"},
+  {id:"S05",name:"Surat",lat:21.170,lng:72.831,nh:"NH48"},{id:"S06",name:"Mumbai",lat:19.298,lng:72.954,nh:"NH48"},
+  {id:"S07",name:"Pune",lat:18.520,lng:73.856,nh:"NH48"},{id:"S08",name:"Hubli",lat:15.364,lng:75.124,nh:"NH48"},
+  {id:"S09",name:"Bangalore",lat:12.972,lng:77.594,nh:"NH48"},{id:"S10",name:"Agra",lat:27.176,lng:78.008,nh:"NH44"},
+  {id:"S11",name:"Gwalior",lat:26.218,lng:78.182,nh:"NH44"},{id:"S12",name:"Nagpur",lat:21.145,lng:79.088,nh:"NH44"},
+  {id:"S13",name:"Hyderabad",lat:17.385,lng:78.487,nh:"NH44"},{id:"S14",name:"Chennai",lat:13.083,lng:80.270,nh:"NH44"},
+  {id:"S15",name:"Kanpur",lat:26.449,lng:80.331,nh:"NH19"},{id:"S16",name:"Varanasi",lat:25.320,lng:82.974,nh:"NH19"},
+  {id:"S17",name:"Patna",lat:25.598,lng:85.138,nh:"NH19"},{id:"S18",name:"Kolkata",lat:22.573,lng:88.363,nh:"NH19"},
+  {id:"S19",name:"Bhopal",lat:23.259,lng:77.413,nh:"NH46"},{id:"S20",name:"Indore",lat:22.719,lng:75.858,nh:"NH52"},
+  {id:"S21",name:"Raipur",lat:21.251,lng:81.630,nh:"NH53"},{id:"S22",name:"Lucknow",lat:26.847,lng:80.947,nh:"NH27"},
+  {id:"S23",name:"Coimbatore",lat:11.017,lng:76.960,nh:"NH544"},{id:"S24",name:"Vizag",lat:17.686,lng:83.218,nh:"NH16"},
+  {id:"S25",name:"Nashik",lat:19.998,lng:73.790,nh:"NH60"},{id:"S26",name:"Delhi",lat:28.679,lng:77.069,nh:"NH44"},
+  {id:"S27",name:"Vijayawada",lat:16.506,lng:80.648,nh:"NH16"},{id:"S28",name:"Kochi",lat:9.939,lng:76.268,nh:"NH66"},
+  {id:"S29",name:"Amritsar",lat:31.634,lng:74.872,nh:"NH3"},{id:"S30",name:"Kolhapur",lat:16.700,lng:74.244,nh:"NH48"},
+];
+
+// ─── DEFAULT CONFIG ────────────────────────────────────────────────────────────
+const DEF_CFG = {
+  yieldThreshold: 75, maxDryRun: 500, maxLegs: 4, maxReturnKm: 800,
+  minLoadFactor: 35,   // % — circuits with less loaded km than this are filtered out
+  capacity: 30, workingDays: 26, singleRange: 1000, doubleRange: 2000,
+  fuelBuf: 0.85, driverSingle: 700, driverDouble: 1200,
+};
+
+// ─── FUEL PLANNER ─────────────────────────────────────────────────────────────
+// ─── STANDALONE LANE YIELD ────────────────────────────────────────────────────
+function calcLaneYield(lane, cfg) {
+  if (!lane.origin || !lane.dest || !lane.dist) return null;
+  const d = lane.dist;
+  const autoV = d > cfg.singleRange * cfg.fuelBuf ? "LNG_DOUBLE" : "LNG_SINGLE";
+  const autoD = d > cfg.driverSingle ? "DOUBLE" : "SINGLE";
+  const vType = (!lane.vType || lane.vType === "AUTO") ? autoV : lane.vType;
+  const dType = (!lane.dType || lane.dType === "AUTO") ? autoD : lane.dType;
+  const depot = lane.depot || lane.origin;
+
+  const fwdRev = lane.fwdRate * cfg.capacity;
+  const revRev = (lane.revTonnes || 0) * (lane.revRate || 0);
+  const revPerTrip = fwdRev + revRev;
+  const loadedKm = d + ((lane.revTonnes || 0) > 0 ? d : 0);
+  const emptyKm = (lane.revTonnes || 0) > 0 ? 0 : d;
+  const totalKm = d * 2;
+  const yieldKm = revPerTrip / totalKm;
+
+  const transitDays = Math.ceil(d / (dType === "DOUBLE" ? cfg.driverDouble : cfg.driverSingle));
+  const rtDays = transitDays * 2;
+  const tripsPerMonth = Math.ceil((lane.monthlyTonnes || 0) / cfg.capacity);
+  const truckDays = tripsPerMonth * rtDays;
+  const trucksNeeded = Math.ceil(truckDays / cfg.workingDays) || 0;
+  const fuel = planFuelLeg(lane.origin.lat, lane.origin.lng, lane.dest.lat, lane.dest.lng, d, vType, cfg, true);
+
+  const thr = cfg.yieldThreshold;
+  let verdict = yieldKm >= thr && fuel.ok ? "OPERATE"
+    : yieldKm >= thr && !fuel.ok ? "INFRA_RISK"
+    : yieldKm >= thr * 0.8 ? "MARGINAL" : "DROP";
+
+  return { vType, dType, depot, fwdRev: Math.round(fwdRev), revRev: Math.round(revRev),
+    revPerTrip: Math.round(revPerTrip), loadedKm, emptyKm, totalKm,
+    yieldKm: Math.round(yieldKm * 10) / 10, transitDays, rtDays,
+    tripsPerMonth, truckDays, trucksNeeded, fuel, verdict };
+}
+
+// ─── CIRCUIT YIELD ────────────────────────────────────────────────────────────
+// ─── FUEL PLANNER — ALL LEGS (loaded strict, empty advisory) ─────────────────
+// For loaded legs: vehicle is on a delivery schedule, cannot deviate → strict check
+// For empty ferry legs: vehicle can reroute via nearest pump → advisory only
+function planFuelLeg(oLat, oLng, dLat, dLng, dist, vType, cfg, strict) {
+  const eff = (vType === "LNG_DOUBLE" ? cfg.doubleRange : cfg.singleRange) * cfg.fuelBuf;
+  if (dist <= eff) return { ok: true, stops: [], n: 0, advisory: false };
+
+  const on = LNG_STNS.filter(s => {
+    const t = hvs(oLat, oLng, s.lat, s.lng) + hvs(s.lat, s.lng, dLat, dLng);
+    return t <= hvs(oLat, oLng, dLat, dLng) * 1.5 + 80;
+  }).sort((a, b) => hvs(oLat, oLng, a.lat, a.lng) - hvs(oLat, oLng, b.lat, b.lng));
+
+  let pool = [...on], stops = [], pos = { lat: oLat, lng: oLng }, left = eff, ok = true, it = 0;
+  while (it++ < 20) {
+    if (hvs(pos.lat, pos.lng, dLat, dLng) * 1.28 <= left) break;
+    const reach = pool.filter(s => { const d = hvs(pos.lat, pos.lng, s.lat, s.lng) * 1.28; return d <= left && d > 30; });
+    if (!reach.length) { ok = false; break; }
+    const best = reach.sort((a, b) => hvs(a.lat, a.lng, dLat, dLng) - hvs(b.lat, b.lng, dLat, dLng))[0];
+    stops.push(best); pool.splice(0, pool.indexOf(best) + 1); pos = { lat: best.lat, lng: best.lng }; left = eff;
+  }
+  // For empty legs: if no pump on direct route, vehicle can deviate — advisory not hard block
+  return { ok: strict ? ok : true, stops, n: stops.length, advisory: !strict && !ok };
+}
+
+function calcCircuitYield(legs, connDists, returnDist, cfg) {
+  // ── Revenue & km breakdown ────────────────────────────────────────────────
+  const totalRev  = legs.reduce((s, l) => s + l.revPerTrip, 0);
+  const loadedKm  = legs.reduce((s, l) => s + l.loadedKm, 0);
+  const ferryKm   = connDists.reduce((s, d) => s + d, 0); // empty between loaded legs
+  const totalKm   = loadedKm + ferryKm + returnDist;
+  const yieldKm   = totalKm > 0 ? totalRev / totalKm : 0;
+  const loadPct   = Math.round((loadedKm / Math.max(totalKm, 1)) * 100);
+
+  // ── Transit days ──────────────────────────────────────────────────────────
+  const loadDays   = legs.reduce((s, l) => s + l.transitDays, 0);
+  const ferryDays  = connDists.reduce((s, d) => s + Math.ceil(d / cfg.driverSingle), 0);
+  const retDays    = Math.ceil(returnDist / cfg.driverSingle);
+  const circuitDays = loadDays + ferryDays + retDays;
+  const circuitsPerTruck = Math.max(Math.floor(cfg.workingDays / Math.max(circuitDays, 1)), 1);
+
+  // ── Volume balancing ──────────────────────────────────────────────────────
+  const legTrips  = legs.map(l => l.tripsPerMonth || 0);
+  const minTrips  = Math.min(...legTrips);
+  const maxTrips  = Math.max(...legTrips);
+  const hasImbalance = maxTrips > minTrips;
+  const tightTrucks  = Math.ceil(minTrips / circuitsPerTruck);
+  const maxTrucks    = Math.ceil(maxTrips / circuitsPerTruck);
+  const standaloneTrucks = legs.reduce((s, l) => s + (l.trucksNeeded || 0), 0);
+
+  // ── Fuel planning — ALL LEGS ──────────────────────────────────────────────
+  // LOADED legs: strict — must have pump on route (vehicle on delivery schedule)
+  // EMPTY FERRY legs: advisory — vehicle can deviate to nearest pump
+  // RETURN TO DEPOT: advisory — empty, fully flexible
+
+  const legFuel = legs.map(leg => {
+    const vType = leg.vType && leg.vType !== "AUTO" ? leg.vType
+      : leg.dist > cfg.singleRange * cfg.fuelBuf ? "LNG_DOUBLE" : "LNG_SINGLE";
+    return planFuelLeg(leg.origin.lat, leg.origin.lng, leg.dest.lat, leg.dest.lng, leg.dist, vType, cfg, true);
+  });
+
+  // Empty ferry fuel checks (advisory only — empty vehicle, can detour)
+  // connDists[i] = ferry from legs[i].dest → legs[i+1].origin
+  const ferryFuel = connDists.map((dist, i) => {
+    if (dist === 0) return { ok: true, stops: [], n: 0, advisory: false };
+    const vType = legs[i].vType && legs[i].vType !== "AUTO" ? legs[i].vType : "LNG_SINGLE";
+    return planFuelLeg(legs[i].dest.lat, legs[i].dest.lng, legs[i+1].origin.lat, legs[i+1].origin.lng, dist, vType, cfg, false);
+  });
+
+  // Return ferry fuel check (advisory — empty, fully flexible)
+  const depot = legs[0].depot || legs[0].origin;
+  const lastLeg = legs[legs.length - 1];
+  const retFuel = returnDist > 0
+    ? planFuelLeg(lastLeg.dest.lat, lastLeg.dest.lng, depot.lat, depot.lng, returnDist, "LNG_SINGLE", cfg, false)
+    : { ok: true, stops: [], n: 0, advisory: false };
+
+  const fuelOk    = legFuel.every(f => f.ok);
+  const infraLegs = legFuel.map((f, i) => !f.ok ? i : -1).filter(i => i >= 0);
+  const totalFuelStops = legFuel.reduce((s, f) => s + f.n, 0)
+    + ferryFuel.reduce((s, f) => s + f.n, 0)
+    + (retFuel.n || 0);
+
+  const thr = cfg.yieldThreshold;
+  const verdict = yieldKm >= thr && fuelOk  ? "OPERATE"
+    : yieldKm >= thr && !fuelOk             ? "INFRA_RISK"
+    : yieldKm >= thr * 0.8                  ? "MARGINAL"
+    :                                          "DROP";
+
+  return {
+    totalRev: Math.round(totalRev), loadedKm: Math.round(loadedKm),
+    ferryKm: Math.round(ferryKm), returnDist: Math.round(returnDist),
+    totalKm: Math.round(totalKm), yieldKm: Math.round(yieldKm * 10) / 10,
+    loadPct, circuitDays, circuitsPerTruck,
+    legTrips, minTrips, maxTrips, hasImbalance,
+    tightCircuits: minTrips, tightTrucks,
+    tightExcess: legTrips.map(t => t - minTrips),
+    maxCircuits: maxTrips, maxTrucks,
+    maxShortfall: legTrips.map(t => maxTrips - t),
+    standaloneTrucks,
+    trucksSavedTight: Math.max(standaloneTrucks - tightTrucks, 0),
+    trucksSavedMax:   Math.max(standaloneTrucks - maxTrucks, 0),
+    improvement: Math.round((yieldKm - Math.max(...legs.map(l => l.yieldKm || 0))) * 10) / 10,
+    legFuel, ferryFuel, retFuel, fuelOk, infraLegs, totalFuelStops,
+    verdict,
+  };
+}
+
+// ─── LANE PRE-CONSOLIDATION ────────────────────────────────────────────────────
+// With real data (200+ rows), many OD pairs appear multiple times (different customers,
+// same route). Brute-force search on 200 lanes = 845M 4-leg combos = days of runtime.
+// Pre-consolidation collapses them to unique city-pair nodes before search.
+// Rules:
+//   • Same-city lanes (Mumbai→Mumbai) → skipped entirely
+//   • Duplicate OD pairs → merged: highest rate kept, volumes summed, best lane name used
+function consolidateLanes(lanes) {
+  const byOD = {};
+  for (const l of lanes) {
+    const oName = l.origin?.placeName || l.origin?.name || "";
+    const dName = l.dest?.placeName   || l.dest?.name   || "";
+    if (!oName || !dName || oName === dName) continue; // skip same-city
+    const key = `${oName.toLowerCase()}||${dName.toLowerCase()}`;
+    if (!byOD[key]) {
+      byOD[key] = { ...l, _mergedVolume: l.fwdMonthlyT || 0, _rowCount: 1 };
+    } else {
+      const ex = byOD[key];
+      // Keep highest-rate lane as the representative; sum volumes
+      if ((l.fwdRate || 0) > (ex.fwdRate || 0)) {
+        byOD[key] = { ...l, _mergedVolume: ex._mergedVolume + (l.fwdMonthlyT || 0), _rowCount: ex._rowCount + 1, revPerTrip: l.revPerTrip, yieldKm: l.yieldKm };
+      } else {
+        ex._mergedVolume += (l.fwdMonthlyT || 0);
+        ex._rowCount += 1;
+      }
+    }
+  }
+  return Object.values(byOD);
+}
+
+// ─── CIRCUIT SEARCH ENGINE — BEAM SEARCH ──────────────────────────────────────
+// With large lane sets, brute-force combinatorial search is infeasible.
+// This engine uses BEAM SEARCH: at each extension step, only the top-BEAM_WIDTH
+// nearest candidate next-legs (by haversine) are explored per path node.
+//
+// Complexity with beam width B, max legs L, unique nodes N:
+//   N × B^(L-1) paths   →  150 × 5^3 = 18,750   (vs 150^4 = 506M brute-force)
+//
+// Additional guards:
+//   • Hard time budget (default 3 min) — stops cleanly, shows best results found
+//   • API call budget — hard cap to prevent runaway costs
+//   • Same-city lane filter applied before search
+//   • Duplicate OD pair consolidation applied before search
+//   • Load factor pre-check skips hopeless extensions early
+async function findAllCircuits(lanes, cfg, onProgress) {
+  // ── Step 1: Consolidate duplicate OD pairs ───────────────────────────────
+  const consolidated = consolidateLanes(lanes);
+  const skipped = lanes.length - consolidated.length;
+  if (skipped > 0) onProgress(`⚡ Consolidated ${lanes.length} lanes → ${consolidated.length} unique routes (${skipped} merged/skipped)`);
+  await new Promise(r => setTimeout(r, 80));
+
+  const workLanes  = consolidated;
+  const N          = workLanes.length;
+  const maxLegs    = Math.min(cfg.maxLegs, 4);
+  const maxFerry   = cfg.maxDryRun;
+  const maxRet     = cfg.maxReturnKm;
+  const minLF      = (cfg.minLoadFactor || 35) / 100;
+  const BEAM_W     = N > 80 ? 5 : N > 40 ? 7 : 10;  // narrow beam for large sets
+  const TIME_LIMIT = 3 * 60 * 1000;   // 3 minutes hard stop
+  const API_BUDGET = N > 100 ? 2000 : N > 50 ? 3000 : 5000;
+  const startTime  = Date.now();
+
+  let apiCalls = 0;
+  let stopped  = false;
+  const results = [];
+  const seen = new Set();
+
+  // Pre-compute haversine distances between all dest→origin pairs for beam ranking
+  // This is O(N²) but pure JS — fine even for 200 nodes
+  const pairHvs = {};
+  for (const a of workLanes) for (const b of workLanes) {
+    if (a.id === b.id || !a.dest || !b.origin) continue;
+    pairHvs[`${a.id}|${b.id}`] = hvs(a.dest.lat, a.dest.lng, b.origin.lat, b.origin.lng);
+  }
+
+  async function build(path, connDists) {
+    if (stopped) return;
+    // Time & budget guards
+    if (Date.now() - startTime > TIME_LIMIT) { stopped = true; return; }
+    if (apiCalls >= API_BUDGET)              { stopped = true; return; }
+
+    const last  = path[path.length - 1];
+    const depot = path[0].depot || path[0].origin;
+
+    // ── Try closing circuit (≥2 legs) ────────────────────────────────────
+    if (path.length >= 2) {
+      const retHv = hvs(last.dest.lat, last.dest.lng, depot.lat, depot.lng) * 1.35;
+      if (retHv <= maxRet * 1.5) {
+        const key = path.map(l => l.id).join(">");
+        if (!seen.has(key)) {
+          seen.add(key);
+          const retR = await apiRoute(last.dest.lat, last.dest.lng, depot.lat, depot.lng);
+          apiCalls++;
+          if (retR.dist <= maxRet) {
+            const cy = calcCircuitYield(path, connDists, retR.dist, cfg);
+            if (cy.loadPct >= minLF * 100) {
+              const depotName = depot.placeName || depot.name || "";
+              results.push({ id: key, legs: [...path], connDists: [...connDists], returnDist: retR.dist, depotName, ...cy });
+              const elapsed = Math.round((Date.now() - startTime) / 1000);
+              const budget  = Math.round(apiCalls / API_BUDGET * 100);
+              onProgress(`✅ ${results.length} circuits · ${apiCalls} API calls · ${elapsed}s · budget ${budget}%`);
+            }
+          }
+        }
+      }
+    }
+
+    // ── Extend: pick top-BEAM_W nearest candidates only ─────────────────
+    if (path.length < maxLegs && !stopped) {
+      const usedIds = new Set(path.map(l => l.id));
+      // Rank all candidates by haversine dist dest→next.origin, take top BEAM_W within ferry budget
+      const candidates = workLanes
+        .filter(b => !usedIds.has(b.id) && b.origin && last.dest)
+        .map(b => ({ lane: b, hv: pairHvs[`${last.id}|${b.id}`] || 9999 }))
+        .filter(x => x.hv <= maxFerry * 1.4)   // haversine pre-filter
+        .sort((a, b) => a.hv - b.hv)
+        .slice(0, BEAM_W);
+
+      for (const { lane: next } of candidates) {
+        if (stopped) break;
+        const ferryR = await apiRoute(last.dest.lat, last.dest.lng, next.origin.lat, next.origin.lng);
+        apiCalls++;
+        if (ferryR.dist > maxFerry) continue;
+        // Tentative load factor check
+        const tLoaded = path.reduce((s, l) => s + l.loadedKm, 0) + next.loadedKm;
+        const tTotal  = tLoaded + [...connDists, ferryR.dist].reduce((s, d) => s + d, 0);
+        if (tTotal > 0 && tLoaded / tTotal < minLF * 0.5) continue;
+        await build([...path, next], [...connDists, ferryR.dist]);
+      }
+    }
+  }
+
+  // ── Main scan loop ───────────────────────────────────────────────────────
+  for (let i = 0; i < workLanes.length; i++) {
+    if (stopped) break;
+    const nm = workLanes[i].origin?.placeName || workLanes[i].origin?.name || "?";
+    const pct = Math.round(i / workLanes.length * 100);
+    const elapsed = Math.round((Date.now() - startTime) / 1000);
+    onProgress(`🔍 ${pct}% · scanning from ${nm} · ${results.length} circuits so far · ${elapsed}s`);
+    await build([workLanes[i]], []);
+    await new Promise(r => setTimeout(r, 5));
+  }
+
+  if (stopped) {
+    const reason = apiCalls >= API_BUDGET ? `API budget (${API_BUDGET} calls)` : `time limit (3 min)`;
+    onProgress(`⏹ Stopped at ${reason} — showing best ${results.length} circuits found`);
+  }
+
+  // De-duplicate: best yield per unique unordered set of lane IDs
+  const bestBySet = {};
+  for (const c of results) {
+    const setKey = [...c.legs.map(l => l.id)].sort().join("|");
+    if (!bestBySet[setKey] || c.yieldKm > bestBySet[setKey].yieldKm) bestBySet[setKey] = c;
+  }
+
+  return Object.values(bestBySet)
+    .sort((a, b) => b.yieldKm - a.yieldKm || b.trucksSavedTight - a.trucksSavedTight);
+}
+
+// ─── FORMAT HELPERS ───────────────────────────────────────────────────────────
+const f2 = n => (isNaN(n) || n == null) ? "-" : Math.round(n).toLocaleString("en-IN");
+const f1 = n => (isNaN(n) || n == null) ? "-" : (Math.round(n * 10) / 10).toLocaleString("en-IN");
+
+function exportCSV(rows, headers, name) {
+  const csv = [headers, ...rows].map(r => r.join(",")).join("\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+  a.download = `${name}.csv`; a.click();
+}
+
+// ─── DESIGN TOKENS ────────────────────────────────────────────────────────────
+const T = {
+  bg:"#03060d", surf:"#070d1a", panel:"#0a1322", bdr:"#121d31", bdrH:"#1a2d46",
+  acc:"#0ea5e9", grn:"#10b981", yel:"#f59e0b", red:"#ef4444", pur:"#8b5cf6", org:"#f97316",
+  txt:"#dce8f6", sub:"#7d96b2", dim:"#374e68",
+};
+const vc = v => ({ OPERATE:T.grn, INFRA_RISK:T.yel, MARGINAL:T.pur, DROP:T.red }[v] || T.dim);
+const vl = v => ({ OPERATE:"✓ Operate", INFRA_RISK:"⚠ Infra Risk", MARGINAL:"≈ Marginal", DROP:"✗ Drop" }[v] || v);
+
+// ─── UI PRIMITIVES ─────────────────────────────────────────────────────────────
+function Pill({ col, children }) {
+  const m = { green:["rgba(16,185,129,.12)","rgba(16,185,129,.4)",T.grn], yellow:["rgba(245,158,11,.12)","rgba(245,158,11,.4)",T.yel], red:["rgba(239,68,68,.12)","rgba(239,68,68,.4)",T.red], blue:["rgba(14,165,233,.12)","rgba(14,165,233,.4)",T.acc], purple:["rgba(139,92,246,.12)","rgba(139,92,246,.4)",T.pur], orange:["rgba(249,115,22,.12)","rgba(249,115,22,.4)",T.org], grey:["rgba(255,255,255,.05)","rgba(255,255,255,.12)",T.sub] };
+  const [bg, bd, tx] = m[col] || m.grey;
+  return <span style={{ display:"inline-flex", alignItems:"center", padding:"2px 8px", borderRadius:4, fontSize:10, fontWeight:700, letterSpacing:"0.07em", textTransform:"uppercase", background:bg, border:`1px solid ${bd}`, color:tx }}>{children}</span>;
+}
+function VP({ v }) { const m = { OPERATE:"green", INFRA_RISK:"yellow", MARGINAL:"purple", DROP:"red" }; return <Pill col={m[v] || "grey"}>{vl(v)}</Pill>; }
+
+const card = () => ({ background:T.panel, border:`1px solid ${T.bdr}`, borderRadius:8, padding:16, marginBottom:14 });
+const ttl  = () => ({ fontSize:10, letterSpacing:"0.14em", textTransform:"uppercase", color:T.dim, marginBottom:12, fontWeight:700 });
+const lbl  = () => ({ display:"block", fontSize:10, color:T.dim, textTransform:"uppercase", letterSpacing:"0.09em", marginBottom:5 });
+const inp  = () => ({ width:"100%", background:T.surf, border:`1px solid ${T.bdr}`, borderRadius:5, color:T.txt, padding:"8px 10px", fontSize:12, outline:"none", boxSizing:"border-box", fontFamily:"inherit" });
+
+function Btn({ v = "ghost", children, onClick, disabled, sm }) {
+  const p = sm ? "4px 10px" : "8px 16px", fs = sm ? 10 : 11;
+  const b = { padding:p, borderRadius:5, fontSize:fs, fontWeight:700, letterSpacing:"0.07em", textTransform:"uppercase", cursor:disabled?"not-allowed":"pointer", fontFamily:"inherit", border:"none", opacity:disabled?.4:1 };
+  if (v === "primary") return <button style={{ ...b, background:`linear-gradient(135deg,#1e40af,${T.acc})`, color:"#fff" }} onClick={onClick} disabled={disabled}>{children}</button>;
+  if (v === "success") return <button style={{ ...b, background:`linear-gradient(135deg,#065f46,${T.grn})`, color:"#fff" }} onClick={onClick} disabled={disabled}>{children}</button>;
+  if (v === "danger")  return <button style={{ ...b, background:"rgba(239,68,68,.1)", border:`1px solid rgba(239,68,68,.3)`, color:T.red }} onClick={onClick} disabled={disabled}>{children}</button>;
+  if (v === "warn")    return <button style={{ ...b, background:"rgba(245,158,11,.1)", border:`1px solid rgba(245,158,11,.3)`, color:T.yel }} onClick={onClick} disabled={disabled}>{children}</button>;
+  return <button style={{ ...b, background:"transparent", border:`1px solid ${T.bdr}`, color:T.sub }} onClick={onClick} disabled={disabled}>{children}</button>;
+}
+function TH({ children }) { return <th style={{ padding:"7px 10px", background:"#020508", color:T.dim, textAlign:"left", fontSize:10, letterSpacing:"0.08em", textTransform:"uppercase", fontWeight:700, borderBottom:`1px solid ${T.bdr}`, whiteSpace:"nowrap" }}>{children}</th>; }
+function TD({ children, color, bold, dim, small }) { return <td style={{ padding:"7px 10px", borderBottom:`1px solid #05091a`, color:dim?T.dim:color||T.txt, fontWeight:bold?700:400, fontSize:small?11:12, verticalAlign:"middle" }}>{children}</td>; }
+
+function YieldBar({ value, threshold }) {
+  const pct = Math.min((value / Math.max(threshold * 1.5, 1)) * 100, 100);
+  const col  = value >= threshold ? T.grn : value >= threshold * 0.8 ? T.yel : T.red;
+  return <div style={{ display:"flex", alignItems:"center", gap:7 }}>
+    <div style={{ flex:1, height:5, background:T.surf, borderRadius:3, overflow:"hidden", minWidth:50 }}>
+      <div style={{ width:`${pct}%`, height:"100%", background:col, borderRadius:3 }} />
+    </div>
+    <span style={{ fontWeight:800, color:col, fontSize:12, minWidth:40, textAlign:"right" }}>₹{f1(value)}</span>
+  </div>;
+}
+
+function KmBar({ loaded, dryRun, returnKm, total }) {
+  const lp = Math.round((loaded  / Math.max(total, 1)) * 100);
+  const dp = Math.round((dryRun  / Math.max(total, 1)) * 100);
+  return <div>
+    <div style={{ display:"flex", height:7, borderRadius:4, overflow:"hidden", gap:1 }}>
+      <div style={{ width:`${lp}%`,        background:T.grn }} title={`Loaded: ${loaded}km`} />
+      <div style={{ width:`${dp}%`,        background:T.yel }} title={`Dry run: ${dryRun}km`} />
+      <div style={{ width:`${100-lp-dp}%`, background:`${T.red}88` }} title={`Return: ${returnKm}km`} />
+    </div>
+    <div style={{ display:"flex", gap:10, fontSize:10, color:T.dim, marginTop:4, flexWrap:"wrap" }}>
+      <span style={{ color:T.grn }}>▬ {f2(loaded)}km loaded ({lp}%)</span>
+      {dryRun > 0 && <span style={{ color:T.yel }}>▬ {f2(dryRun)}km dry run</span>}
+      <span style={{ color:T.red }}>▬ {f2(returnKm)}km return/empty</span>
+    </div>
+  </div>;
+}
+
+function StatCard({ label, value, color, sub }) {
+  return <div style={{ background:T.panel, border:`1px solid ${color}22`, borderLeft:`3px solid ${color}`, borderRadius:7, padding:"12px 14px" }}>
+    <div style={{ fontSize:19, fontWeight:800, color, lineHeight:1 }}>{value}</div>
+    {sub && <div style={{ fontSize:10, color, opacity:.65, marginTop:1 }}>{sub}</div>}
+    <div style={{ fontSize:10, color:T.dim, textTransform:"uppercase", letterSpacing:"0.08em", marginTop:5 }}>{label}</div>
+  </div>;
+}
+
+// ─── LOCATION SEARCH (MapmyIndia autosuggest → eLoc → geocode) ───────────────
+function LocSearch({ label, value, onSelect, ph, icon }) {
+  const [q,      setQ]    = React.useState(value?.placeName || value?.name || "");
+  const [res,    setRes]  = React.useState([]);
+  const [busy,   setBusy] = React.useState(false);
+  const [open,   setOpen] = React.useState(false);
+  const [status, setSts]  = React.useState(""); // "typing"|"geocoding"|"ok"|"err"
+  const deb  = React.useRef();
+  const wrap = React.useRef();
+
+  React.useEffect(() => {
+    if (value) { const n = value.placeName || value.name || ""; if (n !== q) setQ(n); }
+  }, [value]);
+
+  React.useEffect(() => {
+    const h = e => { if (wrap.current && !wrap.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", h);
+    return () => document.removeEventListener("mousedown", h);
+  }, []);
+
+  const search = async v => {
+    if (v.length < 2) { setRes([]); setOpen(false); return; }
+    setBusy(true); setSts("typing");
+    const results = await apiSuggest(v);
+    setRes(results); setOpen(results.length > 0);
+    if (!results.length) setSts("err");
+    setBusy(false);
+  };
+
+  const onChange = e => {
+    const v = e.target.value; setQ(v); onSelect(null); setSts("");
+    clearTimeout(deb.current);
+    deb.current = setTimeout(() => search(v), 350);
+  };
+
+  const pick = async r => {
+    setOpen(false); setRes([]);
+    setQ(r.placeName); setBusy(true); setSts("geocoding");
+
+    // Nominatim results already have lat/lng attached — no second call needed
+    if (r._fromNominatim && r.lat && r.lng) {
+      onSelect({ lat: r.lat, lng: r.lng, placeName: r.placeName, placeAddress: r.placeAddress, eLoc: r.eLoc, source:"nominatim" });
+      setSts("ok"); setBusy(false); return;
+    }
+
+    // MapmyIndia path — resolve eLoc to coordinates
+    const geo = await apiGeocode(r.eLoc);
+    if (geo) {
+      onSelect({ ...geo, placeName: r.placeName, placeAddress: r.placeAddress, source:"mappls" });
+      setSts("ok");
+    } else {
+      setSts("err");
+    }
+    setBusy(false);
+  };
+
+  const mmiLive = _mmiStatus === true;
+  const iconMap = { ok:T.grn, err:T.red, geocoding:T.yel, typing:T.dim };
+  const symMap  = { ok:"✓", err:"✗", geocoding:"⏳", typing:"⏳" };
+
+  return <div ref={wrap} style={{ position:"relative" }}>
+    <label style={lbl()}>{icon || "📍"} {label}</label>
+    <div style={{ position:"relative" }}>
+      <input value={q} onChange={onChange} placeholder={ph || "Type any city, plant, port…"}
+        autoComplete="off"
+        style={{ ...inp(), borderColor: status==="ok"?T.grn:status==="err"?T.red:T.bdr, paddingRight:28 }} />
+      <span style={{ position:"absolute", right:8, top:"50%", transform:"translateY(-50%)", pointerEvents:"none",
+        color: iconMap[status] || T.dim, fontSize:12 }}>
+        {symMap[status] || "⌕"}
+      </span>
+    </div>
+    {open && res.length > 0 && <div style={{ position:"absolute", top:"calc(100% + 3px)", left:0, right:0, background:T.panel, border:`1px solid ${T.bdrH}`, borderRadius:7, zIndex:999, maxHeight:220, overflowY:"auto", boxShadow:"0 14px 40px rgba(0,0,0,.9)" }}>
+      {res.map((r, i) => <div key={i} onMouseDown={() => pick(r)}
+        style={{ padding:"9px 13px", cursor:"pointer", borderBottom:`1px solid ${T.bdr}` }}
+        onMouseEnter={e => e.currentTarget.style.background = "#0e1d30"}
+        onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+        <div style={{ fontWeight:700, color:T.acc, fontSize:12, marginBottom:1 }}>{r.placeName}</div>
+        <div style={{ fontSize:10, color:T.dim, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{r.placeAddress}</div>
+        <div style={{ fontSize:9, color:r._fromNominatim ? T.sub : T.grn, marginTop:1 }}>
+          {r._fromNominatim ? "🗺 OpenStreetMap" : "🟢 MapmyIndia"} · {r.type}
+        </div>
+      </div>)}
+    </div>}
+    {value && <div style={{ fontSize:10, color:T.grn, marginTop:3 }}>📍 {value.lat?.toFixed(4)}, {value.lng?.toFixed(4)} — {value.placeAddress?.slice(0, 60)}</div>}
+  </div>;
+}
+
+// ─── CONFIG TAB ───────────────────────────────────────────────────────────────
+// ─── API STATUS COMPONENT ─────────────────────────────────────────────────────
+function ApiStatus() {
+  const [status, setStatus] = React.useState("checking");
+  React.useEffect(() => {
+    checkMmi().then(ok => setStatus(ok ? "mappls" : "fallback"));
+  }, []);
+
+  const rows = status === "mappls" ? [
+    { label:"Location Search",  desc:"MapmyIndia Autosuggest — India-optimised", col:T.grn, badge:"🟢 LIVE" },
+    { label:"Geocoding",        desc:"MapmyIndia eLoc → coordinates, KV cached forever", col:T.grn, badge:"🟢 LIVE" },
+    { label:"Route Distance",   desc:"MapmyIndia road routing, KV cached 30 days", col:T.grn, badge:"🟢 LIVE" },
+  ] : [
+    { label:"Location Search",  desc:"OpenStreetMap Nominatim — works for all major cities", col:T.yel, badge:"🟡 FREE FALLBACK" },
+    { label:"Geocoding",        desc:"Coordinates from Nominatim search result directly", col:T.yel, badge:"🟡 FREE FALLBACK" },
+    { label:"Route Distance",   desc:"OSRM open-source routing (accurate road distances)", col:T.yel, badge:"🟡 FREE FALLBACK" },
+  ];
+  return <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:10 }}>
+    {rows.map(x => <div key={x.label} style={{ background:T.surf, padding:"10px 12px", borderRadius:5, borderLeft:`3px solid ${x.col}` }}>
+      <div style={{ display:"flex", justifyContent:"space-between", marginBottom:3 }}>
+        <span style={{ fontWeight:700, color:x.col, fontSize:11 }}>{x.label}</span>
+        <span style={{ fontSize:9, color:x.col, letterSpacing:"0.06em" }}>{x.badge}</span>
+      </div>
+      <div style={{ fontSize:11, color:T.dim }}>{x.desc}</div>
+    </div>)}
+  </div>;
+}
+
+function ConfigTab({ cfg, setCfg }) {
+  const set = (k, v) => setCfg(c => ({ ...c, [k]: v }));
+  const Slider = ({ label, k, min, max, step, unit, info }) => <div style={{ marginBottom:14 }}>
+    <div style={{ display:"flex", justifyContent:"space-between", marginBottom:5 }}>
+      <label style={{ fontSize:11, color:T.sub, fontWeight:700 }}>{label}</label>
+      <span style={{ fontSize:13, fontWeight:800, color:T.acc }}>{cfg[k]}{unit}</span>
+    </div>
+    <input type="range" min={min} max={max} step={step || 1} value={cfg[k]} onChange={e => set(k, parseFloat(e.target.value))} />
+    {info && <div style={{ fontSize:10, color:T.dim, marginTop:3, lineHeight:1.6 }}>{info}</div>}
+  </div>;
+
+  return <div>
+    {/* API health */}
+    <div style={{ ...card(), background:"#060e1a", border:`1px solid ${T.acc}22`, marginBottom:14 }}>
+      <div style={ttl()}>🔌 Geocoding & Routing — API Status</div>
+      <ApiStatus />
+      <div style={{ marginTop:12, fontSize:11, color:T.dim, lineHeight:1.8 }}>
+        Location search works immediately using OpenStreetMap (free, no setup). Add MapmyIndia keys in Vercel env vars for better India coverage — especially industrial estates, ports, and tier-2/3 cities. Tool auto-detects and upgrades silently.
+      </div>
+    </div>
+
+    <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14 }}>
+      <div style={card()}>
+        <div style={ttl()}>🎯 Yield & Circuit Optimiser</div>
+        <Slider label="Yield Threshold" k="yieldThreshold" min={30} max={200} step={5} unit=" ₹/km"
+          info="Minimum ₹ revenue per total km (all km: loaded + empty ferry + return to depot). Circuits below this are shown as MARGINAL or DROP."/>
+        <Slider label="Max Empty Ferry (between loaded legs)" k="maxDryRun" min={50} max={1000} step={50} unit=" km"
+          info="Max empty km a vehicle can travel between end of one loaded leg and start of the next. Higher = more circuit options, longer scan time. 500km = about 1 day's travel."/>
+        <Slider label="Max Legs per Circuit" k="maxLegs" min={2} max={5} step={1} unit=" legs"
+          info="Max number of loaded legs in one circuit. 4 legs = vehicle makes 4 loaded deliveries before returning to depot."/>
+        <Slider label="Max Return to Depot (empty)" k="maxReturnKm" min={100} max={1500} step={50} unit=" km"
+          info="Max empty km from last delivery back to depot. Longer = more circuits found but more empty running."/>
+        <Slider label="Min Load Factor" k="minLoadFactor" min={20} max={80} step={5} unit="%"
+          info="Circuits where loaded km is below this % of total km are hidden. Prevents showing circuits with excessive empty running."/>
+      </div>
+      <div>
+        <div style={card()}>
+          <div style={ttl()}>🚛 Fleet & Operations</div>
+          <Slider label="Vehicle Capacity" k="capacity" min={10} max={45} step={1} unit=" T"/>
+          <Slider label="Monthly Working Days" k="workingDays" min={20} max={30} step={1} unit=" days"/>
+          <Slider label="Single Driver Range" k="driverSingle" min={400} max={900} step={50} unit=" km/day"/>
+          <Slider label="Double Driver Range" k="driverDouble" min={800} max={1400} step={50} unit=" km/day"/>
+        </div>
+        <div style={card()}>
+          <div style={ttl()}>⛽ LNG Tank Range</div>
+          <Slider label="Single Tank Range" k="singleRange" min={600} max={1200} step={50} unit=" km"/>
+          <Slider label="Double Tank Range" k="doubleRange" min={1500} max={2500} step={50} unit=" km"/>
+          <Slider label="Fuel Safety Buffer" k="fuelBuf" min={0.7} max={0.95} step={0.05} unit="×"/>
+        </div>
+      </div>
+    </div>
+  </div>;
+}
+
+// ─── LANE MASTER TAB ─────────────────────────────────────────────────────────
+function LaneMasterTab({ lanes, setLanes, cfg, setStatus }) {
+  const [form,      setForm]     = React.useState({ origin:null, dest:null, depot:null, monthlyTonnes:300, fwdRate:3500, revTonnes:0, revRate:0, vType:"AUTO", dType:"AUTO", laneType:"EXISTING", customer:"" });
+  const [computing, setComputing] = React.useState(false);
+  const [preview,   setPreview]  = React.useState(null);
+  const csvRef = React.useRef();
+  const sf = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  const compute = React.useCallback(async () => {
+    if (!form.origin || !form.dest) return;
+    setComputing(true); setPreview(null);
+    const r    = await apiRoute(form.origin.lat, form.origin.lng, form.dest.lat, form.dest.lng);
+    const depot = form.depot || form.origin;
+    const base  = { ...form, dist:r.dist, dur:r.dur, live:r.live, depot };
+    const y     = calcLaneYield(base, cfg);
+    setPreview({ ...base, ...y });
+    setComputing(false);
+  }, [form, cfg]);
+
+  React.useEffect(() => { if (form.origin && form.dest) compute(); }, [form.origin, form.dest, form.fwdRate, form.revTonnes, form.revRate, form.vType, form.dType, form.monthlyTonnes, form.depot]);
+
+  const addLane = () => {
+    if (!preview) return;
+    const lane = { id:Date.now(), laneId:`L${String(lanes.length + 1).padStart(3, "0")}`, source:"manual", ...preview };
+    setLanes(p => [...p, lane]);
+    setForm(f => ({ ...f, origin:null, dest:null, depot:null, customer:"", revTonnes:0, revRate:0 }));
+    setPreview(null);
+  };
+
+  // Resolve a cell value to a geocoded location.
+  // Accepts: plain city name (Nominatim) OR 6-char MapmyIndia eLoc code.
+  const resolveLocation = async (val) => {
+    if (!val || !val.trim()) return null;
+    const v = val.trim();
+
+    // Try MapmyIndia eLoc if it looks like one (short alphanumeric, no spaces)
+    const mmi = await checkMmi();
+    if (mmi && /^[A-Za-z0-9]{4,8}$/.test(v) && !/\s/.test(v)) {
+      const geo = await apiGeocode(v.toUpperCase());
+      if (geo && geo.lat) return geo;
+    }
+
+    // City name path — suggest returns full object with lat/lng for Nominatim
+    const suggestions = await apiSuggest(v);
+    if (!suggestions.length) return null;
+    const top = suggestions[0];
+
+    // Nominatim result already has lat/lng
+    if (top._fromNominatim && top.lat && top.lng) {
+      return { lat: top.lat, lng: top.lng, placeName: top.placeName, placeAddress: top.placeAddress, eLoc: top.eLoc, source:"nominatim" };
+    }
+
+    // MapmyIndia result — resolve eLoc to coordinates
+    const geo = await apiGeocode(top.eLoc);
+    if (geo && geo.lat) return { ...geo, placeName: top.placeName, placeAddress: top.placeAddress, source:"mappls" };
+    return null;
+  };
+
+  const handleCSV = async e => {
+    const f = e.target.files[0]; if (!f) return;
+    setStatus("⏳ Processing CSV…");
+    const text  = await f.text();
+    const lines = text.trim().split("\n").filter(l => l.trim());
+    if (lines.length < 2) { setStatus("⚠ Empty file"); return; }
+    const hdrs = lines[0].split(",").map(h => h.trim().toLowerCase().replace(/[^a-z0-9_]/g, "_"));
+    const get  = (row, ...keys) => { for (const k of keys) if (row[k] !== undefined && row[k] !== "") return row[k]; return ""; };
+    let added = 0, skipped = 0, errors = [];
+
+    for (const line of lines.slice(1)) {
+      if (line.startsWith("#") || !line.trim()) continue; // skip comment/blank rows
+      const vals = line.split(",").map(v => v.trim());
+      const row  = {}; hdrs.forEach((h, i) => { row[h] = vals[i] || ""; });
+
+      const oVal  = get(row, "origin",  "from", "origin_city", "origin_eloc", "from_eloc");
+      const dVal  = get(row, "destination", "dest", "to", "destination_city", "dest_eloc", "to_eloc");
+      const dpVal = get(row, "depot", "home_depot", "base", "depot_eloc");
+
+      if (!oVal || !dVal) { skipped++; errors.push(`Row ${added+skipped+1}: missing origin or destination`); continue; }
+
+      setStatus(`⏳ Geocoding ${oVal} ↔ ${dVal}…`);
+      const [og, dg, dpg] = await Promise.all([
+        resolveLocation(oVal),
+        resolveLocation(dVal),
+        dpVal ? resolveLocation(dpVal) : Promise.resolve(null),
+      ]);
+      if (!og || !dg) { skipped++; errors.push(`Could not geocode: ${!og ? oVal : dVal}`); continue; }
+
+      const depot = dpg || og; // depot defaults to origin city
+
+      // ── Shared fields ───────────────────────────────────────────────────────
+      const vT = get(row, "vehicle_type", "vehicle", "truck_type") || "AUTO";
+      const dT = get(row, "driver_type",  "driver",  "driver_config") || "AUTO";
+      const lt = get(row, "lane_type",    "type",    "status") || "EXISTING";
+
+      // ── FORWARD lane: Origin → Destination ─────────────────────────────────
+      const fwdT = parseFloat(get(row, "fwd_monthly_tonnes", "fwd_tonnes", "monthly_tonnes", "fwd_volume", "volume")) || 0;
+      const fwdR = parseFloat(get(row, "fwd_rate", "forward_rate", "rate")) || 0;
+      const fwdC = get(row, "fwd_customer", "customer", "client");
+
+      if (fwdT > 0 && fwdR > 0) {
+        const r     = await apiRoute(og.lat, og.lng, dg.lat, dg.lng);
+        const base  = { id:Date.now()+added, laneId:`F${String(added+1).padStart(3,"0")}`, direction:"FWD",
+          origin:og, dest:dg, depot, monthlyTonnes:fwdT, fwdRate:fwdR, revTonnes:0, revRate:0,
+          vType:vT, dType:dT, laneType:lt, customer:fwdC, dist:r.dist, dur:r.dur, live:r.live, source:"csv" };
+        const y     = calcLaneYield(base, cfg);
+        setLanes(p => [...p, { ...base, ...y }]);
+        added++;
+        setStatus(`⏳ ${added} lanes added — ${og.placeName||oVal} → ${dg.placeName||dVal} (FWD)`);
+        await new Promise(r => setTimeout(r, 300));
+      }
+
+      // ── BACKWARD lane: Destination → Origin (auto-created if bwd volume > 0) ─
+      const bwdT = parseFloat(get(row, "bwd_monthly_tonnes", "bwd_tonnes", "bwd_volume", "return_tonnes")) || 0;
+      const bwdR = parseFloat(get(row, "bwd_rate", "backward_rate", "return_rate")) || 0;
+      const bwdC = get(row, "bwd_customer", "return_customer");
+
+      if (bwdT > 0 && bwdR > 0) {
+        // Reverse route: dest→origin. Distance is same, reuse cached route.
+        const r     = await apiRoute(dg.lat, dg.lng, og.lat, og.lng);
+        // Depot for backward lane = original depot (vehicle returns same home)
+        const base  = { id:Date.now()+added, laneId:`B${String(added+1).padStart(3,"0")}`, direction:"BWD",
+          origin:dg, dest:og, depot,      // ← origin/dest flipped, depot stays same
+          monthlyTonnes:bwdT, fwdRate:bwdR, revTonnes:0, revRate:0,
+          vType:vT, dType:dT, laneType:lt, customer:bwdC||fwdC, dist:r.dist, dur:r.dur, live:r.live, source:"csv" };
+        const y     = calcLaneYield(base, cfg);
+        setLanes(p => [...p, { ...base, ...y }]);
+        added++;
+        setStatus(`⏳ ${added} lanes added — ${dg.placeName||dVal} → ${og.placeName||oVal} (BWD)`);
+        await new Promise(r => setTimeout(r, 300));
+      }
+
+      if (fwdT === 0 && bwdT === 0) {
+        skipped++;
+        errors.push(`Row skipped — both fwd and bwd volumes are 0 for ${oVal}↔${dVal}`);
+      }
+    }
+
+    const msg = `✓ ${added} lanes created${skipped ? ` · ${skipped} rows skipped` : ""}`;
+    setStatus(msg);
+    if (errors.length) console.warn("CSV import notes:", errors);
+    e.target.value = "";
+  };
+
+  React.useEffect(() => {
+    if (!lanes.length) return;
+    setLanes(prev => prev.map(l => {
+      if (!l.origin || !l.dest || !l.dist) return l;
+      return { ...l, ...calcLaneYield(l, cfg) };
+    }));
+  }, [cfg]);
+
+  return <div>
+    <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14, marginBottom:14 }}>
+      {/* FORM */}
+      <div style={card()}>
+        <div style={ttl()}>➕ Add Lane</div>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:10 }}>
+          <LocSearch icon="🟢" label="Origin" value={form.origin} onSelect={v => sf("origin", v)} ph="Plant / factory / port…"/>
+          <LocSearch icon="🔴" label="Destination" value={form.dest} onSelect={v => sf("dest", v)} ph="Delivery location…"/>
+        </div>
+        <div style={{ marginBottom:10, padding:"10px 12px", background:"#060f1a", borderRadius:6, border:`1px solid ${T.acc}22` }}>
+          <LocSearch icon="🏠" label="Home Depot (vehicle returns here after circuit)" value={form.depot} onSelect={v => sf("depot", v)} ph="Leave blank = defaults to origin"/>
+          <div style={{ fontSize:10, color:T.dim, marginTop:6 }}>After completing {cfg.maxLegs} loaded leg{cfg.maxLegs > 1 ? "s" : ""}, vehicle drives empty back here. <span style={{ color:T.yel }}>Return km counts in yield denominator.</span></div>
+        </div>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:9, marginBottom:9 }}>
+          <div><label style={lbl()}>Monthly Tonnes</label><input type="number" value={form.monthlyTonnes} onChange={e => sf("monthlyTonnes", +e.target.value)} style={inp()} /></div>
+          <div><label style={lbl()}>Fwd Rate ₹/T</label><input type="number" value={form.fwdRate} onChange={e => sf("fwdRate", +e.target.value)} style={inp()} /></div>
+          <div><label style={lbl()}>Lane Type</label>
+            <select value={form.laneType} onChange={e => sf("laneType", e.target.value)} style={inp()}>
+              <option value="EXISTING">Existing (Contracted)</option>
+              <option value="PROBABLE">Probable (Estimated)</option>
+            </select>
+          </div>
+        </div>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:9, marginBottom:9 }}>
+          <div><label style={lbl()}>Rev Tonnes</label><input type="number" min={0} value={form.revTonnes} onChange={e => sf("revTonnes", +e.target.value)} style={inp()} /></div>
+          <div><label style={lbl()}>Rev Rate ₹/T</label><input type="number" min={0} value={form.revRate} onChange={e => sf("revRate", +e.target.value)} style={inp()} /></div>
+          <div><label style={lbl()}>Customer</label><input value={form.customer} onChange={e => sf("customer", e.target.value)} placeholder="Optional" style={inp()} /></div>
+        </div>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:9, marginBottom:12 }}>
+          <div><label style={lbl()}>Vehicle Type</label>
+            <select value={form.vType} onChange={e => sf("vType", e.target.value)} style={inp()}>
+              <option value="AUTO">Auto-Recommend</option>
+              <option value="LNG_SINGLE">LNG Single (1000km)</option>
+              <option value="LNG_DOUBLE">LNG Double (2000km)</option>
+              <option value="EV">EV</option>
+            </select>
+          </div>
+          <div><label style={lbl()}>Driver Config</label>
+            <select value={form.dType} onChange={e => sf("dType", e.target.value)} style={inp()}>
+              <option value="AUTO">Auto-Recommend</option>
+              <option value="SINGLE">Single Driver</option>
+              <option value="DOUBLE">Double Driver (relay)</option>
+            </select>
+          </div>
+        </div>
+        <div style={{ display:"flex", gap:9, flexWrap:"wrap" }}>
+          <Btn v="primary" onClick={compute} disabled={!form.origin || !form.dest || computing}>{computing ? "⏳ Routing…" : "🔄 Compute"}</Btn>
+          <Btn v="success" onClick={addLane} disabled={!preview}>+ Add Lane</Btn>
+          <Btn onClick={() => csvRef.current?.click()}>📂 Upload CSV</Btn>
+          <input ref={csvRef} type="file" accept=".csv" style={{ display:"none" }} onChange={handleCSV} />
+        </div>
+      </div>
+
+      {/* PREVIEW */}
+      <div>
+        {computing && <div style={{ ...card(), textAlign:"center", padding:40 }}>
+          <div style={{ fontSize:26, marginBottom:8 }}>⏳</div>
+          <div style={{ color:T.acc, fontWeight:700, marginBottom:4 }}>MapmyIndia Routing…</div>
+          <div style={{ fontSize:10, color:T.dim }}>Checking KV cache first — cache hits are instant</div>
+        </div>}
+        {!computing && !preview && <div style={{ ...card(), padding:14 }}>
+          <div style={ttl()}>📋 Lane Master CSV — Bidirectional Format</div>
+          <div style={{ fontSize:11, color:T.dim, lineHeight:2, marginBottom:10 }}>
+            Each row = one OD pair. Tool auto-creates:<br/>
+            <span style={{ color:T.grn }}>→ Forward lane</span> (Origin → Destination) when <code>fwd_monthly_tonnes</code> &gt; 0<br/>
+            <span style={{ color:T.acc }}>← Backward lane</span> (Destination → Origin) when <code>bwd_monthly_tonnes</code> &gt; 0<br/>
+            Both lanes go into the master and are available for circuit stitching.<br/>
+            <span style={{ color:T.yel }}>depot</span> = city where vehicle is based (usually same as origin). Defaults to origin if blank.<br/>
+            <span style={{ color:T.yel }}>lane_type</span>: EXISTING (contracted) · PROBABLE (estimated)<br/>
+            <span style={{ color:T.yel }}>vehicle_type</span>: AUTO · LNG_SINGLE · LNG_DOUBLE · EV &nbsp;|&nbsp; <span style={{ color:T.yel }}>driver_type</span>: AUTO · SINGLE · DOUBLE
+          </div>
+          <div style={{ background:"#060f1a", borderRadius:5, padding:"10px 12px", fontSize:11, color:T.dim, lineHeight:2, overflowX:"auto", whiteSpace:"nowrap" }}>
+            <span style={{ color:T.grn }}>origin,destination,depot,fwd_monthly_tonnes,fwd_rate,bwd_monthly_tonnes,bwd_rate,vehicle_type,driver_type,lane_type,fwd_customer,bwd_customer</span><br/>
+            Jamnagar,Ludhiana,Jamnagar,450,4200,200,3600,LNG_DOUBLE,DOUBLE,EXISTING,Reliance,Punjab Textiles<br/>
+            Mumbai,Delhi,Mumbai,300,3800,150,3200,LNG_DOUBLE,DOUBLE,EXISTING,Tata Steel,Havells<br/>
+            Pune,Kolkata,Pune,280,3500,0,0,AUTO,AUTO,PROBABLE,JSW Steel,<br/>
+            Nagpur,Hyderabad,Nagpur,180,3200,90,2800,LNG_SINGLE,SINGLE,EXISTING,ACC Cement,Dalmia
+          </div>
+          <div style={{ marginTop:9, fontSize:10, color:T.dim, lineHeight:1.8 }}>
+            💡 If a lane only moves one way (no return load), put <code>0</code> for <code>bwd_monthly_tonnes</code> and <code>bwd_rate</code> — only the forward lane will be created.
+          </div>
+        </div>}
+        {!computing && preview && <div style={{ ...card(), borderLeft:`3px solid ${vc(preview.verdict)}` }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:12, flexWrap:"wrap", gap:7 }}>
+            <div>
+              <div style={{ fontWeight:800, fontSize:14, color:T.acc, marginBottom:2 }}>{preview.origin?.placeName || preview.origin?.name} → {preview.dest?.placeName || preview.dest?.name}</div>
+              <div style={{ fontSize:10, color:T.dim }}>Depot: <span style={{ color:T.yel }}>{preview.depot?.placeName || preview.depot?.name}</span> · {preview.live && !preview.fallback ? "✓ MapmyIndia" : "⚠ Estimated"} · {f2(preview.dist)}km</div>
+            </div>
+            <VP v={preview.verdict} />
+          </div>
+          <div style={{ background:"#060f1a", borderRadius:6, padding:"12px 13px", marginBottom:10, border:`1px solid ${vc(preview.verdict)}33` }}>
+            <div style={{ fontSize:9, color:T.dim, textTransform:"uppercase", letterSpacing:"0.09em", marginBottom:5 }}>Standalone Yield</div>
+            <div style={{ display:"flex", alignItems:"baseline", gap:10, marginBottom:7 }}>
+              <span style={{ fontSize:26, fontWeight:800, color:vc(preview.verdict) }}>₹{f1(preview.yieldKm)}/km</span>
+              <span style={{ fontSize:11, color:T.dim }}>threshold: ₹{cfg.yieldThreshold}/km</span>
+            </div>
+            <KmBar loaded={preview.loadedKm} dryRun={0} returnKm={preview.emptyKm} total={preview.totalKm} />
+          </div>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:7 }}>
+            {[{ l:"Rev/Trip", v:`₹${f2(preview.revPerTrip)}`, c:T.grn }, { l:"Trips/Month", v:preview.tripsPerMonth, c:T.acc }, { l:"Trucks Needed", v:preview.trucksNeeded, c:T.yel }].map(m => <div key={m.l} style={{ background:T.surf, padding:"8px 10px", borderRadius:5 }}>
+              <div style={{ fontSize:9, color:T.dim, textTransform:"uppercase", marginBottom:2 }}>{m.l}</div>
+              <div style={{ fontWeight:700, color:m.c, fontSize:13 }}>{m.v}</div>
+            </div>)}
+          </div>
+        </div>}
+      </div>
+    </div>
+
+    {/* LANE LIST */}
+    {lanes.length > 0 && <div style={card()}>
+      <div style={{ display:"flex", justifyContent:"space-between", marginBottom:10, flexWrap:"wrap", gap:7 }}>
+        <div style={ttl()}>
+          {lanes.length} Lanes
+          &nbsp;·&nbsp; <span style={{ color:T.grn }}>{lanes.filter(l=>l.direction==="FWD"||!l.direction).length} forward</span>
+          &nbsp;·&nbsp; <span style={{ color:T.acc }}>{lanes.filter(l=>l.direction==="BWD").length} backward</span>
+          &nbsp;·&nbsp; {[...new Set(lanes.map(l => l.depot?.placeName || l.depot?.name || l.origin?.placeName))].length} depots
+        </div>
+        <div style={{ display:"flex", gap:7 }}>
+          <Btn v="primary" sm onClick={() => exportCSV(
+            lanes.map(l => [l.laneId, l.direction||"FWD", l.origin?.placeName||l.origin?.name, l.dest?.placeName||l.dest?.name, l.depot?.placeName||l.depot?.name, l.laneType||"", l.customer||"", l.monthlyTonnes, l.fwdRate, l.dist, l.vType, l.dType, l.yieldKm, l.verdict]),
+            ["LaneID","Direction","Origin","Destination","Depot","Type","Customer","Mo Tonnes","Rate ₹/T","Dist km","Vehicle","Driver","Yield ₹/km","Verdict"],
+            "lane_master_export"
+          )}>⬇ Export</Btn>
+          <Btn v="danger" sm onClick={() => setLanes([])}>🗑 Clear</Btn>
+        </div>
+      </div>
+      <div style={{ overflowX:"auto" }}><table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
+        <thead><tr>{["Lane", "Dir", "Route", "Depot", "Type", "Mo Tonnes", "Rate ₹/T", "Dist", "Yield", "Verdict", ""].map(h => <TH key={h}>{h}</TH>)}</tr></thead>
+        <tbody>{lanes.map(l => <tr key={l.id} style={{ background:l.verdict==="DROP"?"rgba(239,68,68,.025)":l.verdict==="OPERATE"?"rgba(16,185,129,.015)":"" }}>
+          <TD dim>{l.laneId}</TD>
+          <TD><Pill col={l.direction==="BWD"?"blue":"green"}>{l.direction||"FWD"}</Pill></TD>
+          <TD bold color={T.acc}>{l.origin?.placeName||l.origin?.name} → {l.dest?.placeName||l.dest?.name}</TD>
+          <TD><span style={{ color:T.yel, fontSize:11 }}>🏠 {l.depot?.placeName||l.depot?.name||l.origin?.placeName}</span></TD>
+          <TD><Pill col={l.laneType==="PROBABLE"?"purple":"grey"}>{l.laneType||"EX"}</Pill></TD>
+          <TD>{f2(l.monthlyTonnes)}T</TD>
+          <TD>₹{f2(l.fwdRate)}/T</TD>
+          <TD>{f2(l.dist)}km</TD>
+          <TD style={{ minWidth:140 }}><YieldBar value={l.yieldKm||0} threshold={cfg.yieldThreshold}/></TD>
+          <TD><VP v={l.verdict}/></TD>
+          <TD><Btn v="danger" sm onClick={() => setLanes(p => p.filter(x => x.id !== l.id))}>✕</Btn></TD>
+        </tr>)}</tbody>
+      </table></div>
+    </div>}
+  </div>;
+}
+
+// ─── YIELD ANALYSIS TAB ───────────────────────────────────────────────────────
+function YieldTab({ lanes, cfg }) {
+  if (!lanes.length) return <div style={{ textAlign:"center", padding:52, color:T.dim }}><div style={{ fontSize:34, marginBottom:10 }}>📊</div><div>Add lanes in Lane Master first.</div></div>;
+
+  const groups = { OPERATE:[], INFRA_RISK:[], MARGINAL:[], DROP:[] };
+  for (const l of lanes) (groups[l.verdict] || groups.DROP).push(l);
+  const avgYield = (lanes.reduce((s, l) => s + (l.yieldKm || 0), 0) / lanes.length).toFixed(1);
+  const totalRev = lanes.reduce((s, l) => s + ((l.revPerTrip || 0) * (l.tripsPerMonth || 0)), 0);
+
+  const LaneCard = ({ l }) => <div style={{ padding:"12px 14px", background:T.surf, borderRadius:6, marginBottom:9, border:`1px solid ${vc(l.verdict)}22` }}>
+    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", flexWrap:"wrap", gap:7, marginBottom:9 }}>
+      <div>
+        <span style={{ fontWeight:700, color:T.acc, fontSize:13 }}>{l.origin?.placeName || l.origin?.name} → {l.dest?.placeName || l.dest?.name}</span>
+        <span style={{ fontSize:10, color:T.dim, marginLeft:9 }}>{l.customer || ""} · {f2(l.dist)}km · 🏠 {l.depot?.placeName || l.depot?.name || l.origin?.placeName}</span>
+      </div>
+      <VP v={l.verdict} />
+    </div>
+    <div style={{ marginBottom:8 }}><YieldBar value={l.yieldKm || 0} threshold={cfg.yieldThreshold} /></div>
+    <KmBar loaded={l.loadedKm} dryRun={0} returnKm={l.emptyKm} total={l.totalKm} />
+    <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:7, marginTop:9 }}>
+      {[{ lb:"Rev/Trip", v:`₹${f2(l.revPerTrip)}`, c:T.grn }, { lb:"Mo Rev", v:`₹${f2((l.revPerTrip || 0) * (l.tripsPerMonth || 0))}`, c:T.grn }, { lb:"Trips/Mo", v:l.tripsPerMonth, c:T.acc }, { lb:"Trucks", v:l.trucksNeeded, c:T.yel }, { lb:"LNG Stops", v:l.fuel?.ok ? `${l.fuel.n}×` : "⚠ Gap", c:l.fuel?.ok ? T.grn : T.red }].map(m => <div key={m.lb} style={{ background:T.panel, padding:"7px 9px", borderRadius:5 }}>
+        <div style={{ fontSize:9, color:T.dim, textTransform:"uppercase", letterSpacing:"0.07em", marginBottom:2 }}>{m.lb}</div>
+        <div style={{ fontWeight:700, color:m.c, fontSize:12 }}>{m.v}</div>
+      </div>)}
+    </div>
+    {l.verdict === "DROP" && <div style={{ marginTop:8, padding:"7px 11px", background:"rgba(239,68,68,.07)", border:`1px solid rgba(239,68,68,.2)`, borderRadius:5, fontSize:11, color:T.yel }}>Fix: ₹{f2(Math.ceil((cfg.yieldThreshold * l.totalKm) / cfg.capacity))}/T fwd rate needed (currently ₹{f2(l.fwdRate)}), or add backhaul to close ₹{f2(cfg.yieldThreshold * l.totalKm - l.revPerTrip)} gap.</div>}
+  </div>;
+
+  const Sec = ({ title, list, bd }) => list.length > 0 && <div style={{ ...card(), border:`1px solid ${bd}` }}>
+    <div style={ttl()}>{title} ({list.length})</div>
+    {list.map(l => <LaneCard key={l.id} l={l} />)}
+  </div>;
+
+  return <div>
+    <div style={{ display:"grid", gridTemplateColumns:"repeat(6,1fr)", gap:10, marginBottom:14 }}>
+      <StatCard label="Total Lanes" value={lanes.length} color={T.acc} />
+      <StatCard label="Operate" value={groups.OPERATE.length} color={T.grn} />
+      <StatCard label="Infra Risk" value={groups.INFRA_RISK.length} color={T.yel} />
+      <StatCard label="Marginal" value={groups.MARGINAL.length} color={T.pur} />
+      <StatCard label="Drop" value={groups.DROP.length} color={T.red} />
+      <StatCard label="Avg Yield" value={`₹${avgYield}`} sub="/km" color={parseFloat(avgYield) >= cfg.yieldThreshold ? T.grn : T.yel} />
+    </div>
+    <Sec title="✓ Operate"             list={groups.OPERATE}    bd="rgba(16,185,129,.2)" />
+    <Sec title="⚠ Infrastructure Risk" list={groups.INFRA_RISK} bd="rgba(245,158,11,.2)" />
+    <Sec title="≈ Marginal"            list={groups.MARGINAL}   bd="rgba(139,92,246,.2)" />
+    <Sec title="✗ Drop"               list={groups.DROP}       bd="rgba(239,68,68,.2)" />
+  </div>;
+}
+
+// ─── STITCH ENGINE TAB ────────────────────────────────────────────────────────
+function StitchTab({ lanes, cfg }) {
+  const [circuits, setCircuits]   = React.useState([]);
+  const [running,  setRunning]    = React.useState(false);
+  const [progress, setProgress]   = React.useState("");
+  const [done,     setDone]       = React.useState(false);
+  const [iMode,    setIMode]      = React.useState({});
+  const legColors = ["#0ea5e9", "#10b981", "#f59e0b", "#8b5cf6"];
+
+  const run = async () => {
+    setRunning(true); setCircuits([]); setDone(false);
+    try { const res = await findAllCircuits(lanes, cfg, setProgress); setCircuits(res); }
+    finally { setRunning(false); setDone(true); }
+  };
+
+  const mode = id => iMode[id] || "tight";
+  const toggleMode = id => setIMode(m => ({ ...m, [id]: m[id] === "max" ? "tight" : "max" }));
+
+  // Pre-flight analysis
+  const sameCity  = lanes.filter(l => (l.origin?.placeName||l.origin?.name) === (l.dest?.placeName||l.dest?.name));
+  const odMap     = {};
+  lanes.forEach(l => { const k = `${l.origin?.placeName||l.origin?.name}||${l.dest?.placeName||l.dest?.name}`; odMap[k] = (odMap[k]||0)+1; });
+  const dupCount  = Object.values(odMap).filter(v => v > 1).reduce((s, v) => s + v - 1, 0);
+  const uniqueN   = Object.keys(odMap).length - sameCity.length;
+  const beamW     = uniqueN > 80 ? 5 : uniqueN > 40 ? 7 : 10;
+  const estPaths  = Math.min(uniqueN * Math.pow(beamW, cfg.maxLegs - 1), 50000);
+  const estSecs   = Math.round(estPaths * 0.05);
+  const willCap   = estSecs > 180;
+
+  return <div>
+    <div style={{ ...card(), background:"#060d1a", border:`1px solid ${T.acc}22`, marginBottom:14 }}>
+      <div style={ttl()}>🔗 Circuit Stitch Engine — Beam Search</div>
+
+      {/* Pre-flight data quality panel */}
+      <div style={{ background:"#040b16", borderRadius:7, padding:"12px 14px", marginBottom:14, border:`1px solid #0d1e35` }}>
+        <div style={{ fontSize:10, color:T.dim, letterSpacing:"0.1em", textTransform:"uppercase", fontWeight:700, marginBottom:10 }}>📊 Pre-Flight: Lane Data Analysis</div>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10, marginBottom:10 }}>
+          {[
+            { l:"Total Rows",         v: lanes.length,  c: T.txt, note:"in lane master" },
+            { l:"Unique OD Pairs",    v: uniqueN,       c: T.acc, note:"after dedup" },
+            { l:"Same-City Lanes",    v: sameCity.length, c: sameCity.length > 0 ? T.yel : T.grn, note:"skipped in search" },
+            { l:"Duplicate Rows",     v: dupCount,      c: dupCount > 0 ? T.yel : T.grn, note:"merged (best rate kept)" },
+          ].map(x => <div key={x.l} style={{ background:T.surf, padding:"8px 11px", borderRadius:5 }}>
+            <div style={{ fontSize:9, color:T.dim, textTransform:"uppercase", letterSpacing:"0.07em", marginBottom:2 }}>{x.l}</div>
+            <div style={{ fontSize:18, fontWeight:800, color:x.c }}>{x.v}</div>
+            <div style={{ fontSize:9, color:T.dim, marginTop:2 }}>{x.note}</div>
+          </div>)}
+        </div>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:10 }}>
+          {[
+            { l:"Search Method",  v:`Beam search (width ${beamW})`, c: T.grn, note:`narrow beam keeps it fast with ${uniqueN} nodes` },
+            { l:"Est. Paths",     v: estPaths.toLocaleString("en-IN"), c: T.acc, note:`vs ${(uniqueN**cfg.maxLegs).toLocaleString("en-IN")} brute-force` },
+            { l:"Est. Runtime",   v: willCap ? "3 min (capped)" : `~${estSecs}s`, c: willCap ? T.yel : T.grn, note: willCap ? "stops at 3min, shows best found" : "finishes fully" },
+          ].map(x => <div key={x.l} style={{ background:T.surf, padding:"8px 11px", borderRadius:5 }}>
+            <div style={{ fontSize:9, color:T.dim, textTransform:"uppercase", letterSpacing:"0.07em", marginBottom:2 }}>{x.l}</div>
+            <div style={{ fontSize:13, fontWeight:700, color:x.c }}>{x.v}</div>
+            <div style={{ fontSize:9, color:T.dim, marginTop:2 }}>{x.note}</div>
+          </div>)}
+        </div>
+      </div>
+
+      <div style={{ display:"flex", gap:10, flexWrap:"wrap", alignItems:"center" }}>
+        <Btn v="primary" onClick={run} disabled={lanes.length < 2 || running}>
+          {running ? `⏳ ${progress}` : `🔗 Find Circuits (${uniqueN} unique routes, max ${cfg.maxLegs} legs)`}
+        </Btn>
+        {circuits.length > 0 && <Btn onClick={() => exportCSV(circuits.map((c, i) => [i+1, c.legs.map(l=>l.origin?.placeName||l.origin?.name).join(">"), c.depotName, c.legs.length, c.totalKm, c.loadedKm, c.ferryKm, c.returnDist, c.loadPct+"%", c.totalRev, c.yieldKm, c.totalFuelStops, c.fuelOk?"Yes":"No-L"+c.infraLegs.map(j=>j+1).join("+"), c.tightTrucks, c.trucksSavedTight, c.verdict]), ["#","Legs","Depot","N Legs","Total km","Loaded km","Ferry km","Return km","Load%","Rev","Yield","Fuel Stops","Fuel OK","Trucks","Saved","Verdict"],"circuits")}>⬇ Export</Btn>}
+        {done && !running && <span style={{ fontSize:11, color:T.grn }}>{progress}</span>}
+      </div>
+    </div>
+
+    {done && circuits.length === 0 && <div style={{ textAlign:"center", padding:"36px 20px", color:T.dim }}>
+      No circuits found within max empty ferry ({cfg.maxDryRun}km) and return ({cfg.maxReturnKm}km) constraints, or all circuits are below the {cfg.minLoadFactor}% load factor minimum. Try increasing "Max Empty Ferry" or reducing "Min Load Factor" in Config.
+    </div>}
+
+    {circuits.length > 0 && <>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:10, marginBottom:14 }}>
+        <StatCard label="Total Circuits"    value={circuits.length} color={T.acc} />
+        <StatCard label="Operate"           value={circuits.filter(c => c.verdict === "OPERATE").length} color={T.grn} />
+        <StatCard label="Infra Risk"        value={circuits.filter(c => c.verdict === "INFRA_RISK").length} color={T.yel} sub="yield ok, no pump" />
+        <StatCard label="Best Yield"        value={`₹${circuits[0]?.yieldKm}`} sub="/km" color={T.grn} />
+        <StatCard label="Max Trucks Saved"  value={Math.max(...circuits.map(c => c.trucksSavedTight), 0)} sub="tight option" color={T.org} />
+      </div>
+
+      {circuits.map((c, i) => {
+        const m = mode(c.id);
+        const trucks = m === "tight" ? c.tightTrucks : c.maxTrucks;
+        const saved  = m === "tight" ? c.trucksSavedTight : c.trucksSavedMax;
+        const depotGeo = c.legs[0].depot || c.legs[0].origin;
+
+        // Build full journey segments: loaded, ferry, loaded, ferry, ..., return
+        // Each segment: { type:"loaded"|"ferry"|"return", from, to, km, legIdx? }
+        const segments = [];
+        c.legs.forEach((leg, li) => {
+          segments.push({ type:"loaded", from: leg.origin?.placeName||leg.origin?.name, to: leg.dest?.placeName||leg.dest?.name, km: leg.dist, legIdx: li, revenue: leg.revPerTrip, fuel: c.legFuel?.[li] });
+          if (li < c.legs.length - 1) {
+            segments.push({ type:"ferry", from: leg.dest?.placeName||leg.dest?.name, to: c.legs[li+1].origin?.placeName||c.legs[li+1].origin?.name, km: c.connDists[li], fuel: c.ferryFuel?.[li] });
+          }
+        });
+        segments.push({ type:"return", from: c.legs[c.legs.length-1].dest?.placeName||c.legs[c.legs.length-1].dest?.name, to: depotGeo?.placeName||depotGeo?.name, km: c.returnDist, fuel: c.retFuel });
+
+        const segColor = { loaded: T.grn, ferry: T.org, return: T.red };
+        const segLabel = { loaded: "● LOADED", ferry: "○ EMPTY FERRY", return: "○ RETURN" };
+
+        return <div key={c.id} style={{ ...card(), borderLeft:`3px solid ${vc(c.verdict)}` }}>
+          {/* Header */}
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:12, flexWrap:"wrap", gap:7 }}>
+            <div>
+              <span style={{ fontSize:11, color:T.dim, fontWeight:700 }}>#{i+1} · {c.legs.length} LOADED LEGS · Depot: </span>
+              <span style={{ color:T.yel, fontWeight:700 }}>🏠 {c.depotName}</span>
+            </div>
+            <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+              <VP v={c.verdict} />
+              <Pill col={c.loadPct >= 65 ? "green" : c.loadPct >= 45 ? "yellow" : "red"}>{c.loadPct}% loaded</Pill>
+              {saved > 0 && <Pill col="orange">-{saved} truck{saved > 1 ? "s" : ""}</Pill>}
+              {c.hasImbalance && <Pill col="yellow">⚖ Imbalance</Pill>}
+            </div>
+          </div>
+
+          {/* ── FULL JOURNEY MAP ─────────────────────────────────────────── */}
+          <div style={{ marginBottom:12, background:"#030810", borderRadius:8, padding:"12px 14px", border:`1px solid #0d1e35` }}>
+            <div style={{ fontSize:9, color:T.dim, letterSpacing:"0.12em", textTransform:"uppercase", marginBottom:10, fontWeight:700 }}>Full Journey — Every Km Accounted For</div>
+            {/* Journey nodes row */}
+            <div style={{ display:"flex", alignItems:"center", flexWrap:"wrap", gap:0, marginBottom:12 }}>
+              <div style={{ padding:"5px 10px", background:`${T.yel}18`, border:`1px solid ${T.yel}44`, borderRadius:5, fontSize:11, fontWeight:800, color:T.yel }}>🏠 {c.depotName || "Depot"}</div>
+              {segments.map((seg, si) => <React.Fragment key={si}>
+                <div style={{ display:"flex", flexDirection:"column", alignItems:"center", padding:"0 6px", minWidth:60 }}>
+                  <div style={{ fontSize:9, color:segColor[seg.type], letterSpacing:"0.07em", fontWeight:700, marginBottom:2 }}>{segLabel[seg.type]}</div>
+                  <div style={{ height:3, width:"100%", minWidth:40, background:segColor[seg.type], opacity:0.6, borderRadius:2 }} />
+                  <div style={{ fontSize:10, color:segColor[seg.type], fontWeight:700, marginTop:2 }}>{f2(seg.km)}km</div>
+                  {seg.type === "loaded" && <div style={{ fontSize:9, color:T.grn, marginTop:1 }}>₹{f2(seg.revenue)}</div>}
+                  {seg.type !== "loaded" && seg.km > 0 && seg.fuel && <div style={{ fontSize:9, color: seg.fuel.advisory ? T.yel : T.sub, marginTop:1 }}>{seg.fuel.advisory ? "⚠ detour for LNG" : seg.fuel.n > 0 ? `⛽×${seg.fuel.n}` : "✓ in range"}</div>}
+                </div>
+                <div style={{ padding:"5px 10px", background: seg.type==="loaded" ? `${T.grn}12` : `${T.dim}10`, border:`1px solid ${seg.type==="loaded" ? T.grn+"33" : "#1a2a3a"}`, borderRadius:5, fontSize:11, fontWeight:seg.type==="loaded"?800:400, color:seg.type==="loaded"?T.acc:T.sub }}>
+                  {seg.to}
+                </div>
+              </React.Fragment>)}
+            </div>
+
+            {/* km breakdown bar */}
+            <div>
+              <div style={{ display:"flex", height:8, borderRadius:4, overflow:"hidden", gap:1, marginBottom:5 }}>
+                {segments.map((seg, si) => <div key={si} style={{ flex: Math.max(seg.km, 1), background: seg.type==="loaded" ? T.grn : seg.type==="ferry" ? T.org : `${T.red}88`, transition:"flex 0.3s" }} title={`${segLabel[seg.type]}: ${seg.km}km`} />)}
+              </div>
+              <div style={{ display:"flex", gap:12, fontSize:10, flexWrap:"wrap" }}>
+                <span style={{ color:T.grn }}>▬ Loaded: {f2(c.loadedKm)}km ({c.loadPct}%)</span>
+                {c.ferryKm > 0 && <span style={{ color:T.org }}>▬ Empty ferry: {f2(c.ferryKm)}km</span>}
+                {c.returnDist > 0 && <span style={{ color:T.red }}>▬ Return empty: {f2(c.returnDist)}km</span>}
+                <span style={{ color:T.dim }}>Total: {f2(c.totalKm)}km</span>
+              </div>
+            </div>
+          </div>
+
+          {/* ── YIELD SUMMARY ────────────────────────────────────────────── */}
+          <div style={{ background:"#060f1a", borderRadius:6, padding:"12px 13px", marginBottom:10, border:`1px solid ${vc(c.verdict)}33` }}>
+            <div style={{ display:"flex", alignItems:"baseline", gap:16, marginBottom:8, flexWrap:"wrap" }}>
+              <div>
+                <div style={{ fontSize:9, color:T.dim, textTransform:"uppercase", letterSpacing:"0.09em", marginBottom:2 }}>Circuit Yield</div>
+                <span style={{ fontSize:26, fontWeight:800, color:vc(c.verdict) }}>₹{f1(c.yieldKm)}/km</span>
+              </div>
+              <div>
+                <div style={{ fontSize:9, color:T.dim, textTransform:"uppercase", letterSpacing:"0.09em", marginBottom:2 }}>vs Best Standalone</div>
+                <span style={{ fontSize:16, fontWeight:700, color:c.improvement > 0 ? T.grn : T.red }}>{c.improvement > 0 ? "+" : ""}₹{f1(c.improvement)}/km</span>
+              </div>
+              <div>
+                <div style={{ fontSize:9, color:T.dim, textTransform:"uppercase", letterSpacing:"0.09em", marginBottom:2 }}>Leg Yields (standalone)</div>
+                <span style={{ fontSize:11 }}>{c.legs.map((l, li) => <span key={li} style={{ marginRight:10, color:T.dim }}>L{li+1}: <strong style={{ color:vc(l.verdict) }}>₹{l.yieldKm}</strong></span>)}</span>
+              </div>
+            </div>
+          </div>
+
+          {/* ── STATS GRID ────────────────────────────────────────────────── */}
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(6,1fr)", gap:7, marginBottom:10 }}>
+            {[
+              { l:"Circuit Rev",    v:`₹${f2(c.totalRev)}`,     c:T.grn },
+              { l:"Total km",       v:`${f2(c.totalKm)}km`,     c:T.txt },
+              { l:"Load Factor",    v:`${c.loadPct}%`,           c:c.loadPct>=65?T.grn:c.loadPct>=45?T.yel:T.red },
+              { l:"Circuit Days",   v:`${c.circuitDays}d`,       c:T.txt },
+              { l:"Trips/Truck/Mo", v:c.circuitsPerTruck,        c:T.acc },
+              { l:`Trucks (${m})`,  v:trucks,                    c:T.yel },
+            ].map(m2 => <div key={m2.l} style={{ background:T.surf, padding:"8px 10px", borderRadius:5 }}>
+              <div style={{ fontSize:9, color:T.dim, textTransform:"uppercase", letterSpacing:"0.07em", marginBottom:2 }}>{m2.l}</div>
+              <div style={{ fontWeight:700, color:m2.c, fontSize:12 }}>{m2.v}</div>
+            </div>)}
+          </div>
+
+          {/* ── FUEL PLAN — ALL SEGMENTS ──────────────────────────────────── */}
+          <div style={{ marginBottom:12, padding:"12px 14px", background:"#04090f", border:`1px solid ${c.fuelOk ? T.grn+"33" : T.yel+"44"}`, borderRadius:6 }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10, flexWrap:"wrap", gap:6 }}>
+              <div style={{ fontWeight:700, fontSize:11, color:c.fuelOk ? T.grn : T.yel }}>⛽ LNG Fuel Plan — All Segments</div>
+              <div style={{ display:"flex", gap:7, alignItems:"center" }}>
+                <span style={{ fontSize:10, color:T.dim }}>Total pump stops: <strong style={{ color:T.acc }}>{c.totalFuelStops}</strong></span>
+                {c.fuelOk ? <Pill col="green">All loaded legs covered</Pill> : <Pill col="yellow">⚠ {c.infraLegs.length} loaded leg{c.infraLegs.length>1?"s":""} without pump</Pill>}
+              </div>
+            </div>
+            <div style={{ display:"flex", flexDirection:"column", gap:5 }}>
+              {segments.map((seg, si) => {
+                const fuel = seg.fuel;
+                if (!fuel) return null;
+                const isLoaded = seg.type === "loaded";
+                const borderCol = isLoaded ? (fuel.ok ? T.grn : T.yel) : (fuel.advisory ? T.yel : T.grn);
+                return <div key={si} style={{ display:"flex", alignItems:"flex-start", gap:10, padding:"8px 10px", background:T.panel, borderRadius:5, borderLeft:`3px solid ${segColor[seg.type]}` }}>
+                  <div style={{ minWidth:90, fontSize:10, color:segColor[seg.type], fontWeight:700, textTransform:"uppercase", letterSpacing:"0.06em", flexShrink:0 }}>{segLabel[seg.type]}</div>
+                  <div style={{ flex:1, fontSize:11, color:T.dim }}>
+                    <span style={{ color:T.txt }}>{seg.from} → {seg.to}</span> · {f2(seg.km)}km
+                    {isLoaded && <span style={{ marginLeft:8 }}>
+                      {fuel.ok ? (fuel.n === 0 ? <span style={{ color:T.grn }}> ✓ Within tank range</span> : <span style={{ color:T.grn }}> ✓ {fuel.n} pump stop{fuel.n>1?"s":""}: {fuel.stops?.map(s=>s.name).join(" → ")}</span>) : <span style={{ color:T.yel }}> ⚠ No pump on route — upgrade to double tank</span>}
+                    </span>}
+                    {!isLoaded && seg.km > 0 && <span style={{ marginLeft:8 }}>
+                      {fuel.advisory ? <span style={{ color:T.yel }}> ⚠ Beyond single tank — driver routes via nearest pump city</span> : fuel.n > 0 ? <span style={{ color:T.sub }}> ⛽ {fuel.n} pump enroute: {fuel.stops?.map(s=>s.name).join(" → ")}</span> : <span style={{ color:T.sub }}> ✓ Within range</span>}
+                    </span>}
+                    {!isLoaded && seg.km === 0 && <span style={{ color:T.sub }}> ✓ Same city</span>}
+                  </div>
+                </div>;
+              })}
+            </div>
+            <div style={{ marginTop:8, fontSize:10, color:T.dim, lineHeight:1.7 }}>
+              <span style={{ color:T.grn }}>● Loaded legs:</span> strict planning — pump must be on route (customer delivery schedule){"  "}
+              <span style={{ color:T.org }}>○ Empty ferry/return:</span> advisory — empty vehicle can deviate up to 50km to reach nearest pump
+            </div>
+          </div>
+
+          {/* ── INFRA RISK ────────────────────────────────────────────────── */}
+          {!c.fuelOk && c.verdict === "INFRA_RISK" && <div style={{ marginBottom:10, padding:"9px 12px", background:"rgba(245,158,11,.07)", border:`1px solid rgba(245,158,11,.3)`, borderRadius:5, fontSize:11, color:T.yel }}>
+            ⚠ <strong>Infra Risk:</strong> Yield clears ₹{cfg.yieldThreshold}/km but {c.infraLegs.length === 1 ? "Leg " + (c.infraLegs[0]+1) + " has" : "Legs " + c.infraLegs.map(j=>j+1).join(", ") + " have"} no LNG pump on the corridor. Operate after confirming pump availability or switching to double-tank.
+          </div>}
+
+          {/* ── VOLUME IMBALANCE ──────────────────────────────────────────── */}
+          {c.hasImbalance && <div style={{ padding:"12px 14px", background:"#07101e", border:`1px solid ${T.yel}33`, borderRadius:6, marginBottom:10 }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10, flexWrap:"wrap", gap:7 }}>
+              <div style={{ fontWeight:700, color:T.yel, fontSize:11 }}>⚖ Volume Imbalance — Choose Planning Option</div>
+              <div style={{ display:"flex", gap:6 }}>
+                <Btn v={m === "tight" ? "primary" : "ghost"} sm onClick={() => toggleMode(c.id)}>Tight ({c.tightCircuits} circuits)</Btn>
+                <Btn v={m === "max"   ? "warn"    : "ghost"} sm onClick={() => toggleMode(c.id)}>Max ({c.maxCircuits} circuits)</Btn>
+              </div>
+            </div>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
+              <div style={{ padding:"10px 12px", background:m === "tight" ? "#0a1a10" : "#06101a", border:`1px solid ${m === "tight" ? T.grn + "44" : T.bdr}`, borderRadius:5 }}>
+                <div style={{ fontWeight:700, color:T.grn, marginBottom:5, fontSize:11 }}>Option 1 — Tight</div>
+                <div style={{ fontSize:11, color:T.dim, lineHeight:1.8 }}>
+                  {c.tightCircuits} stitched circuits · {c.tightTrucks} trucks · -{c.trucksSavedTight} saved<br/>
+                  {c.legs.map((l, li) => c.tightExcess[li] > 0 && <div key={li} style={{ color:T.yel }}>· L{li+1}: +{c.tightExcess[li]} standalone trips</div>)}
+                </div>
+              </div>
+              <div style={{ padding:"10px 12px", background:m === "max" ? "#1a100a" : "#06101a", border:`1px solid ${m === "max" ? T.yel + "44" : T.bdr}`, borderRadius:5 }}>
+                <div style={{ fontWeight:700, color:T.yel, marginBottom:5, fontSize:11 }}>Option 2 — Max</div>
+                <div style={{ fontSize:11, color:T.dim, lineHeight:1.8 }}>
+                  {c.maxCircuits} stitched circuits · {c.maxTrucks} trucks · -{c.trucksSavedMax} saved<br/>
+                  {c.legs.map((l, li) => c.maxShortfall[li] > 0 && <div key={li} style={{ color:T.org }}>· L{li+1}: {c.maxShortfall[li]} trips under-utilised → spot/partial</div>)}
+                </div>
+              </div>
+            </div>
+          </div>}
+
+          {saved > 0 && <div style={{ padding:"7px 11px", background:"rgba(249,115,22,.07)", border:`1px solid rgba(249,115,22,.2)`, borderRadius:5, fontSize:11, color:T.org }}>🚛 Fleet saving ({m}): {saved} truck{saved > 1 ? "s" : ""} freed ({c.standaloneTrucks} → {trucks}).</div>}
+        </div>;
+      })}
+    </>}
+  </div>;
+}
+
+// ─── MONTHLY PLAN TAB ─────────────────────────────────────────────────────────
+function MonthlyPlanTab({ lanes, cfg }) {
+  if (!lanes.length) return <div style={{ textAlign:"center", padding:52, color:T.dim }}><div style={{ fontSize:34, marginBottom:10 }}>📅</div><div>Add lanes in Lane Master first.</div></div>;
+
+  const totalTrips    = lanes.reduce((s, l) => s + (l.tripsPerMonth || 0), 0);
+  const totalTruckDays = lanes.reduce((s, l) => s + (l.truckDays || 0), 0);
+  const totalTrucks   = lanes.reduce((s, l) => s + (l.trucksNeeded || 0), 0);
+  const totalRev      = lanes.reduce((s, l) => s + ((l.revPerTrip || 0) * (l.tripsPerMonth || 0)), 0);
+  const totalLoaded   = lanes.reduce((s, l) => s + (l.loadedKm || 0) * (l.tripsPerMonth || 0), 0);
+  const totalEmpty    = lanes.reduce((s, l) => s + (l.emptyKm  || 0) * (l.tripsPerMonth || 0), 0);
+  const netYield      = totalLoaded + totalEmpty > 0 ? totalRev / (totalLoaded + totalEmpty) : 0;
+  const loadFactor    = Math.round((totalLoaded / (totalLoaded + totalEmpty || 1)) * 100);
+
+  const depotGroups = {};
+  for (const l of lanes) {
+    const dk = l.depot?.placeName || l.depot?.name || l.origin?.placeName || "Unknown";
+    if (!depotGroups[dk]) depotGroups[dk] = [];
+    depotGroups[dk].push(l);
+  }
+
+  return <div>
+    <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:10, marginBottom:14 }}>
+      <StatCard label="Total Trips/Mo"   value={f2(totalTrips)}   color={T.acc} />
+      <StatCard label="Truck-Days/Mo"    value={f2(totalTruckDays)} color={T.txt} />
+      <StatCard label="Trucks Required"  value={totalTrucks}       color={T.yel} />
+      <StatCard label="Monthly Revenue"  value={`₹${f2(totalRev)}`} color={T.grn} />
+      <StatCard label="Network Yield"    value={`₹${f1(netYield)}`} sub="/km avg" color={netYield >= cfg.yieldThreshold ? T.grn : T.yel} />
+    </div>
+
+    <div style={card()}>
+      <div style={ttl()}>📦 Network km Summary</div>
+      <KmBar loaded={totalLoaded} dryRun={0} returnKm={totalEmpty} total={totalLoaded + totalEmpty} />
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:9, marginTop:11 }}>
+        {[{ l:"Loaded km/mo", v:`${f2(totalLoaded)}km`, c:T.grn }, { l:"Empty km/mo", v:`${f2(totalEmpty)}km`, c:T.red }, { l:"Load Factor", v:`${loadFactor}%`, c:loadFactor >= 70 ? T.grn : T.yel }].map(m => <div key={m.l} style={{ background:T.surf, padding:"9px 11px", borderRadius:5 }}>
+          <div style={{ fontSize:9, color:T.dim, textTransform:"uppercase", marginBottom:2 }}>{m.l}</div>
+          <div style={{ fontWeight:700, color:m.c, fontSize:13 }}>{m.v}</div>
+        </div>)}
+      </div>
+    </div>
+
+    {Object.entries(depotGroups).map(([depot, dLanes]) => {
+      const dTrips  = dLanes.reduce((s, l) => s + (l.tripsPerMonth || 0), 0);
+      const dTrucks = dLanes.reduce((s, l) => s + (l.trucksNeeded || 0), 0);
+      const dRev    = dLanes.reduce((s, l) => s + ((l.revPerTrip || 0) * (l.tripsPerMonth || 0)), 0);
+      return <div key={depot} style={card()}>
+        <div style={{ display:"flex", justifyContent:"space-between", marginBottom:10, flexWrap:"wrap", gap:7 }}>
+          <div style={ttl()}>🏠 {depot} · {dLanes.length} lanes</div>
+          <div style={{ display:"flex", gap:10 }}>
+            <span style={{ fontSize:11, color:T.acc }}>{dTrips} trips/mo</span>
+            <span style={{ fontSize:11, color:T.yel }}>{dTrucks} trucks</span>
+            <span style={{ fontSize:11, color:T.grn }}>₹{f2(dRev)}/mo</span>
+          </div>
+        </div>
+        <div style={{ overflowX:"auto" }}><table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
+          <thead><tr>{["Lane", "Route", "Type", "Mo T", "Trips/Mo", "Transit", "RT Days", "Truck-Days", "Trucks", "Rev/Trip", "Mo Rev", "Yield", "Verdict"].map(h => <TH key={h}>{h}</TH>)}</tr></thead>
+          <tbody>{dLanes.map(l => <tr key={l.id}>
+            <TD dim>{l.laneId}</TD>
+            <TD bold color={T.acc}>{l.origin?.placeName || l.origin?.name} → {l.dest?.placeName || l.dest?.name}</TD>
+            <TD><Pill col={l.laneType === "PROBABLE" ? "purple" : "blue"}>{l.laneType || "EX"}</Pill></TD>
+            <TD>{f2(l.monthlyTonnes)}T</TD>
+            <TD bold color={T.acc}>{l.tripsPerMonth}</TD>
+            <TD>{l.transitDays}d</TD>
+            <TD>{l.rtDays}d</TD>
+            <TD color={T.yel}>{l.truckDays}</TD>
+            <TD bold color={T.yel}>{l.trucksNeeded}</TD>
+            <TD color={T.grn}>₹{f2(l.revPerTrip)}</TD>
+            <TD bold color={T.grn}>₹{f2((l.revPerTrip || 0) * (l.tripsPerMonth || 0))}</TD>
+            <TD><YieldBar value={l.yieldKm || 0} threshold={cfg.yieldThreshold} /></TD>
+            <TD><VP v={l.verdict} /></TD>
+          </tr>)}</tbody>
+        </table></div>
+      </div>;
+    })}
+    <div style={{ display:"flex", justifyContent:"flex-end", marginTop:4 }}>
+      <Btn v="primary" onClick={() => exportCSV(lanes.map(l => [l.laneId, l.origin?.placeName || l.origin?.name, l.dest?.placeName || l.dest?.name, l.depot?.placeName || l.depot?.name || "", l.laneType || "", l.customer || "", l.monthlyTonnes, cfg.capacity, l.tripsPerMonth, l.transitDays, l.rtDays, l.truckDays, l.trucksNeeded, l.revPerTrip, (l.revPerTrip || 0) * (l.tripsPerMonth || 0), l.yieldKm, l.verdict]), ["Lane", "Origin", "Dest", "Depot", "Type", "Customer", "Mo T", "Cap/Trip", "Trips/Mo", "Transit", "RT Days", "Truck-Days", "Trucks", "Rev/Trip", "Mo Rev", "Yield", "Verdict"], "monthly_plan")}>⬇ Export Full Plan</Btn>
+    </div>
+  </div>;
+}
+
+// ─── APP ROOT ─────────────────────────────────────────────────────────────────
+function App() {
+  const [tab,    setTab]    = React.useState("config");
+  const [cfg,    setCfg]    = React.useState(DEF_CFG);
+  const [lanes,  setLanes]  = React.useState([]);
+  const [status, setStatus] = React.useState("");
+
+  const TABS = [
+    { id:"config",  ic:"⚙",  l:"Config" },
+    { id:"master",  ic:"📥", l:`Lane Master${lanes.length ? ` (${lanes.length})` : ""}` },
+    { id:"yield",   ic:"📊", l:"Yield Analysis" },
+    { id:"stitch",  ic:"🔗", l:"Stitch Engine" },
+    { id:"plan",    ic:"📅", l:"Monthly Plan" },
+  ];
+
+  return <div style={{ fontFamily:"inherit", background:T.bg, minHeight:"100vh", color:T.txt, fontSize:13 }}>
+    {/* HEADER */}
+    <div style={{ background:"linear-gradient(90deg,#020406,#050c18)", borderBottom:`1px solid ${T.bdr}`, padding:"11px 20px", display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:8 }}>
+      <div style={{ display:"flex", alignItems:"center", gap:11 }}>
+        <div style={{ width:36, height:36, background:`linear-gradient(135deg,${T.acc},#1e40af)`, borderRadius:9, display:"flex", alignItems:"center", justifyContent:"center", fontSize:19 }}>🛣</div>
+        <div>
+          <div style={{ fontSize:17, fontWeight:800, color:T.acc, letterSpacing:"0.04em", lineHeight:1 }}>NETPLAN PRO v4</div>
+          <div style={{ fontSize:9, color:T.dim, letterSpacing:"0.12em", textTransform:"uppercase", marginTop:2 }}>MapmyIndia · Vercel KV Cache · N-Leg Circuits · Per-Lane Depots</div>
+        </div>
+      </div>
+      <div style={{ display:"flex", gap:6, flexWrap:"wrap", alignItems:"center" }}>
+        <Pill col="blue">₹{cfg.yieldThreshold}/km</Pill>
+        <Pill col="orange">{cfg.maxLegs}-leg circuits</Pill>
+        <Pill col="yellow">{cfg.maxDryRun}km dry run</Pill>
+        <Pill col="grey">{cfg.maxReturnKm}km max return</Pill>
+        {lanes.length > 0 && <Pill col="green">{lanes.length} lanes · {[...new Set(lanes.map(l => l.depot?.placeName || l.depot?.name || l.origin?.placeName))].length} depots</Pill>}
+        {status && <span style={{ fontSize:10, color:status.startsWith("✓") ? T.grn : status.startsWith("⚠") ? T.red : T.yel }}>{status}</span>}
+      </div>
+    </div>
+
+    {/* TABS */}
+    <div style={{ display:"flex", background:"#030609", borderBottom:`1px solid ${T.bdr}`, padding:"0 16px", overflowX:"auto" }}>
+      {TABS.map(t => <button key={t.id} onClick={() => setTab(t.id)} style={{ padding:"11px 16px", fontSize:11, fontWeight:700, letterSpacing:"0.08em", textTransform:"uppercase", cursor:"pointer", border:"none", borderBottom:tab === t.id ? `2px solid ${T.acc}` : "2px solid transparent", background:"transparent", color:tab === t.id ? T.acc : T.dim, fontFamily:"inherit", whiteSpace:"nowrap" }}>{t.ic} {t.l}</button>)}
+    </div>
+
+    {/* BODY */}
+    <div style={{ padding:"16px 20px", maxWidth:1440, margin:"0 auto" }}>
+      {tab === "config" && <ConfigTab cfg={cfg} setCfg={setCfg} />}
+      {tab === "master" && <LaneMasterTab lanes={lanes} setLanes={setLanes} cfg={cfg} setStatus={setStatus} />}
+      {tab === "yield"  && <YieldTab lanes={lanes} cfg={cfg} />}
+      {tab === "stitch" && <StitchTab lanes={lanes} cfg={cfg} />}
+      {tab === "plan"   && <MonthlyPlanTab lanes={lanes} cfg={cfg} />}
+    </div>
+  </div>;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
